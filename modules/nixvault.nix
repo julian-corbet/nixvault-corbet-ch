@@ -39,21 +39,41 @@
 #   shredded and its keyslot removed once the passphrase slot is confirmed working, so the
 #   passphrase becomes the ONLY way into the container.
 #
-#   UPDATE MANY times after that, and this needs no NEW secret: `nixvault-assemble` stages the
-#   manifest and builds a squashfs image entirely without touching the LUKS container (no
-#   passphrase involved at all). `nixvault-update` then opens the container (the operator types the
-#   SAME passphrase they already know -- a normal unlock, not a new secret being created or
-#   managed), writes the fresh squashfs straight into the mapper device, and closes it. The
-#   container itself is never reformatted; only its contents change. This is the whole reason
+#   UPDATE MANY times after that, and this is where ASSEMBLE and COMMIT genuinely split, not two
+#   names for one idempotent action. `nixvault-assemble` stages the manifest and builds a squashfs
+#   image entirely without touching the LUKS container -- no passphrase involved at all, so it is
+#   the one part of this lifecycle safe to run unattended, off `schedule.onCalendar`.
+#   `nixvault-update` is the ONLY thing that ever writes into the container: it opens it (the
+#   operator types the SAME passphrase they already know -- a normal unlock, not a new secret being
+#   created or managed), writes the fresh squashfs straight into the mapper device, and closes it
+#   again. Opening a LUKS container needs its passphrase full stop -- there is no such thing as an
+#   unattended `luksOpen` -- so committing is, and must stay, a deliberate human act, never a timer.
+#   The container itself is never reformatted; only its contents change. This is the whole reason
 #   nixvault-create and nixvault-update are two different tools instead of one idempotent one --
 #   they have completely different relationships to the passphrase.
 #
-#   STALENESS IS NOT COSMETIC HERE. A header backup or key that predates a passphrase change looks
-#   exactly like a working recovery path and is not one. `nixvault-verify` tracks two on-disk
+#   (CORRECTED HERE having once been stated wrong: an earlier draft of the design record this
+#   module implements claimed updates need "no secret at all: luksOpen -> dd -> luksClose". That
+#   is false -- `luksOpen` needs the passphrase every time -- and the record itself now says so;
+#   see nixrescue.md §7.3's own correction. This module was already built the right way round
+#   before that record caught up: assemble unattended, commit attended, never the reverse.)
+#
+#   STALENESS IS NOT COSMETIC HERE, and neither is DRIFT. A header backup or key that predates a
+#   passphrase change looks exactly like a working recovery path and is not one. `nixvault-verify`
+#   is the unattended COMPARE + ALERT step the timer actually runs: it re-checks two on-disk
 #   timestamps that need no passphrase to read -- when content was last staged, and when it was
-#   last actually written into the container -- and warns once either drifts past
-#   `staleness.maxAgeDays`. `staleness.alertCommand` is a deliberate escape hatch rather than a
-#   hardcoded channel: a public module cannot know which fleet's paging system to call.
+#   last actually committed -- against `staleness.maxAgeDays`, AND it compares the squashfs
+#   `nixvault-assemble` just staged against what `nixvault-update` last actually wrote into the
+#   container. That second check cannot literally open the container to look (that would need the
+#   passphrase, defeating the point of running it from a timer) -- instead `nixvault-assemble`
+#   leaves a plaintext sha256 of every image it stages, and `nixvault-update` stamps that same
+#   digest as "committed" the moment it writes it in. As long as nixvault-update is the only write
+#   path into the container (nixvault-create refuses to reformat an existing one, so it is), staged
+#   == committed is an exact, secret-free proxy for "the container already holds this". A mismatch
+#   means the manifest has moved on since the last commit -- content drift, not merely age -- and
+#   `nixvault-verify` says so in as many words: run nixvault-update. `staleness.alertCommand` is a
+#   deliberate escape hatch rather than a hardcoded channel: a public module cannot know which
+#   fleet's paging system to call.
 #
 # THE PACKING PIPELINE (nixvault-assemble): rm -rf the staging directory, re-populate it (generated
 # categories from `cryptsetup luksHeaderBackup` against `nixvault.luksVolumes`; static categories
@@ -88,6 +108,34 @@
 #           after the system it belongs to is already up.
 #   NOT   : which rescue image boots in front of a main, or how that rescue reaches this vault --
 #           that is nixrescue's domain. This module has no opinion on how it is invoked.
+#
+# ONE FILE, BOTH BACKENDS -- exported unchanged as both `nixosModules.default` and
+# `systemManagerModules.default` (see flake.nix), the same "one backend, both platforms" shape as
+# nixfs's modules/install.nix, and for the identical reason: everything below resolves to option
+# surface system-manager supports IDENTICALLY to NixOS, confirmed by reading its actual module
+# source (numtide/system-manager, nix/modules/*.nix), not assumed:
+#
+#   - `environment.systemPackages` -- a real system-manager option (nix/modules/environment.nix),
+#     rendered into the exact same `pkgs.buildEnv` install every one of nixvault's tools reaches
+#     the host through.
+#   - `systemd.services.*` / `systemd.timers.*` -- real, fully-supported options
+#     (nix/modules/systemd.nix) built from the identical nixpkgs `systemdUtils` code NixOS itself
+#     uses; `wantedBy = [ "multi-user.target" ]` / `[ "timers.target" ]` are silently rewritten to
+#     `system-manager.target` internally, but nixvault only ever names them, never depends on which
+#     target actually owns them.
+#   - `assertions` / `warnings` -- real options, and (confirmed in nix/lib.nix's
+#     `returnIfNoAssertions`) actually enforced at build time exactly like NixOS: a failed
+#     assertion throws before `system-manager switch` can run, a warning surfaces the same way.
+#
+# What this module deliberately never touches is exactly what system-manager CANNOT do:
+# `users.users` (no user/group option surface at all -- every nixvault tool runs as whatever user
+# invokes it, never a dedicated service account), `boot.*` (no bootloader or kernel-parameter
+# surface -- irrelevant anyway, a vault has no boot-time role, see SCOPE above), and no dependency
+# on `services.zram-generator` or any other NixOS-only systemd-generator integration. Nothing in
+# nixvault's actual job -- packing a manifest, writing it into a LUKS container an operator opens
+# by hand -- ever needed any of those, so there was nothing to design around, unlike nixram's
+# zswap/oomd surface (which genuinely does need a NixOS-only escape hatch on one backend -- see
+# that project's own system-manager/ split for the case where "one file" is NOT the honest answer).
 #
 { config, lib, pkgs, ... }:
 
@@ -174,6 +222,13 @@ let
       chmod 0600 "$out"
 
       date -u +%s > "${cfg.stateDirectory}/last-assembled-timestamp"
+
+      # A plaintext fingerprint of the image just staged -- needs no passphrase to write or to
+      # read. This is the other half of nixvault-verify's drift check: nixvault-update stamps this
+      # SAME digest as "committed" the moment it actually writes an image into the LUKS container,
+      # so comparing the two lets an unattended timer notice the manifest has moved on since the
+      # last commit without ever opening the container to look.
+      sha256sum "$out" | cut -d' ' -f1 > "${cfg.stateDirectory}/staged-hash"
 
       budget_bytes=$(( ${toString activeTier.budgetMiB} * 1024 * 1024 ))
       actual_bytes=$(stat -c%s "$out")
@@ -262,6 +317,16 @@ let
       trap - EXIT
 
       date -u +%s > "${cfg.stateDirectory}/last-written-timestamp"
+
+      # Stamp what was ACTUALLY committed, in plaintext, next to the timestamp above -- computed
+      # fresh from $image rather than trusted from nixvault-assemble's own staged-hash file, so this
+      # is correct even if something else produced $image. This is the other half of
+      # nixvault-verify's drift check (see nixvault-assemble): as long as this tool is the only
+      # thing that ever writes the container -- which nixvault-create's reformat refusal
+      # guarantees -- staged-hash == committed-hash is an exact, secret-free proxy for "the
+      # container already holds this manifest".
+      sha256sum "$image" | cut -d' ' -f1 > "${cfg.stateDirectory}/committed-hash"
+
       echo "nixvault-update: done. $device now carries the freshly assembled vault contents. The container itself was never reformatted -- only its contents changed."
     '';
   };
@@ -294,13 +359,42 @@ let
       check_age "${cfg.stateDirectory}/last-assembled-timestamp" "staged vault image (nixvault-assemble)" "${toString cfg.staleness.maxAgeDays}"
       check_age "${cfg.stateDirectory}/last-written-timestamp" "on-disk vault contents (nixvault-update)" "${toString cfg.staleness.maxAgeDays}"
 
+      # CONTENT DRIFT -- the compare step this lifecycle actually needs (see the module's own
+      # "THE LIFECYCLE" header). nixvault-verify cannot open the LUKS container to see what it
+      # holds -- that needs the passphrase, and this runs unattended off a timer -- so it compares
+      # plaintext fingerprints instead: nixvault-assemble hashes every squashfs it stages, and
+      # nixvault-update stamps that SAME hash as "committed" the instant it writes one in. Staged
+      # == committed is therefore an exact, secret-free proxy for "the container already holds the
+      # current manifest", true as long as nixvault-update is the only path that ever writes it
+      # (nixvault-create refuses to reformat an existing container, so it is).
+      staged_hash_file="${cfg.stateDirectory}/staged-hash"
+      committed_hash_file="${cfg.stateDirectory}/committed-hash"
+      if [ ! -e "$staged_hash_file" ]; then
+        echo "WARN: no staged image yet ($staged_hash_file does not exist) -- run nixvault-assemble first"
+        warn=$((warn + 1))
+      elif [ ! -e "$committed_hash_file" ]; then
+        echo "WARN: this vault's content has never been committed ($committed_hash_file does not exist)"
+        echo "ACTION REQUIRED: run nixvault-update to write the staged image into the LUKS container -- you will be asked for the passphrase."
+        warn=$((warn + 1))
+      else
+        staged_hash=$(cat "$staged_hash_file")
+        committed_hash=$(cat "$committed_hash_file")
+        if [ "$staged_hash" != "$committed_hash" ]; then
+          echo "WARN: the assembled manifest has DRIFTED from what the LUKS container holds (staged $staged_hash, committed $committed_hash)"
+          echo "ACTION REQUIRED: run nixvault-update to commit the new content -- you will be asked for the passphrase."
+          warn=$((warn + 1))
+        else
+          echo "PASS: assembled content matches what nixvault-update last committed ($staged_hash)"
+        fi
+      fi
+
       if [ "$warn" -gt 0 ]; then
-        echo "nixvault-verify: $warn staleness warning(s). A header backup or key that predates a passphrase change looks exactly like a recovery path and is not one -- treat this as an alarm, not decoration."
+        echo "nixvault-verify: $warn staleness/drift warning(s). A header backup or key that predates a passphrase change looks exactly like a recovery path and is not one -- treat this as an alarm, not decoration."
         ${lib.optionalString (cfg.staleness.alertCommand != null) ''
-          ${cfg.staleness.alertCommand} "nixvault: $warn staleness warning(s) on this host" || true
+          ${cfg.staleness.alertCommand} "nixvault: $warn staleness/drift warning(s) on this host -- action required, see nixvault-verify's own output" || true
         ''}
       else
-        echo "nixvault-verify: no staleness warnings."
+        echo "nixvault-verify: no staleness or drift warnings."
       fi
 
       exit 0
@@ -403,13 +497,15 @@ in
       type = lib.types.str;
       default = "/var/lib/nixvault";
       description = ''
-        Where the staged manifest, the built squashfs, and the two staleness timestamps live on
-        this host. Created 0700: the staging directory holds a plaintext duplicate of everything
-        the vault will eventually carry, including the sops age keys and the Secure Boot PKI,
-        before nixvault-update encrypts it into the container. That duplicate adds no new exposure
-        beyond normal root-on-this-host scope -- the same material already sits in plaintext
-        wherever nixvault.sources.* points at -- but it must never itself be the thing that leaves
-        this machine. Only the LUKS container is meant to travel.
+        Where the staged manifest, the built squashfs, the two staleness timestamps, and the two
+        plaintext content fingerprints (staged-hash, committed-hash -- see nixvault-verify's own
+        drift check) live on this host. Created 0700: the staging directory holds a plaintext
+        duplicate of everything the vault will eventually carry, including the sops age keys and
+        the Secure Boot PKI, before nixvault-update encrypts it into the container. That duplicate
+        adds no new exposure beyond normal root-on-this-host scope -- the same material already
+        sits in plaintext wherever nixvault.sources.* points at -- but it must never itself be the
+        thing that leaves this machine. Only the LUKS container is meant to travel. The two
+        sha256 fingerprints carry no secret material at all -- they identify content, not open it.
       '';
     };
 
@@ -464,9 +560,11 @@ in
       example = "curl -fsS -d";
       description = ''
         Escape hatch: a command nixvault-verify invokes (with one argument, the warning message)
-        whenever a staleness check fails. Left unset by default and only ever logged to the
-        journal, because a public module cannot know which fleet's paging or notification channel
-        to call -- point this at whatever the consuming host already uses.
+        whenever a staleness check OR a content-drift check fails -- see nixvault-verify's own
+        compare step (staged content vs. what nixvault-update last actually committed). Left unset
+        by default and only ever logged to the journal, because a public module cannot know which
+        fleet's paging or notification channel to call -- point this at whatever the consuming host
+        already uses.
       '';
     };
 
@@ -550,7 +648,7 @@ in
     };
 
     systemd.services.nixvault-verify = {
-      description = "nixvault: warn if the staged image or the on-disk vault contents are stale";
+      description = "nixvault: warn if the staged image or the on-disk vault contents are stale, or if the manifest has drifted from what is committed";
       wantedBy = [ "multi-user.target" ];
       after = [ "nixvault-assemble.service" ];
       serviceConfig = {

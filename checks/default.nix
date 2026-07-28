@@ -4,7 +4,9 @@
 # configuration through NixOS's own eval-config.nix and inspects what the module RENDERS or
 # whether the build fails. Nothing here boots anything -- the claims under test (which tier resolves
 # to which categories, which tools are always/never wired to systemd, which combinations must fail
-# the build) are entirely eval-time properties.
+# the build) are entirely eval-time properties. `lifecycle-vm-test` (its own file) is the one real
+# runtime test: a `pkgs.testers.nixosTest` that exercises the whole create/assemble/commit/drift
+# lifecycle against a real LUKS container on a loopback file inside the VM.
 #
 # The claims worth failing CI over:
 #
@@ -16,7 +18,10 @@
 #      both need a human-known passphrase and must never be runnable unattended.
 #   4. Sources given for a category outside the active tier warn instead of being silently dropped.
 #   5. Duplicate `luksVolumes` names fail the build (they would collide as header-backup filenames).
-{ pkgs, lib, nixpkgs, system, nixvaultModule }:
+#   6. Both backends agree -- the NixOS and system-manager evaluations of the same input resolve to
+#      the identical tool set and manifest shape, proving modules/nixvault.nix's own "ONE FILE, BOTH
+#      BACKENDS" claim rather than merely asserting it in a comment.
+{ pkgs, lib, nixpkgs, system, nixvaultModule, systemManagerLib }:
 
 let
   manifest = import ../lib/manifest.nix { };
@@ -77,6 +82,49 @@ let
 
   hasTool = cfg: name:
     lib.any (p: lib.hasInfix name (p.name or "")) cfg.environment.systemPackages;
+
+  # ── system-manager backend -- proves modules/nixvault.nix's "ONE FILE, BOTH BACKENDS" claim ────
+  # makeSystemConfig gates its entire return value on assertions passing (nix/lib.nix's
+  # returnIfNoAssertions), so `.config` is unreachable when one fails -- a faithful match for what
+  # a real `nix build .#systemConfigs.<host>` does, the same shape as nixfs's own evalSm.
+  evalSm = extraConfig:
+    (systemManagerLib.makeSystemConfig {
+      modules = [
+        nixvaultModule
+        extraConfig
+        { nixpkgs.hostPlatform = system; }
+      ];
+    }).config;
+
+  cfg-sm-small = evalSm validBase;
+  cfg-sm-medium = evalSm (lib.recursiveUpdate validBase { nixvault.tier = "medium"; });
+
+  backendParityChecks = [
+    (check "backend-parity/small-manifest-categories-match"
+      (sorted cfg-sm-small.nixvault.manifestCategories == sorted cfg-small.nixvault.manifestCategories)
+      "system-manager: ${builtins.toJSON (sorted cfg-sm-small.nixvault.manifestCategories)}, NixOS: ${builtins.toJSON (sorted cfg-small.nixvault.manifestCategories)}")
+
+    (check "backend-parity/medium-manifest-categories-match"
+      (sorted cfg-sm-medium.nixvault.manifestCategories == sorted cfg-medium.nixvault.manifestCategories)
+      "system-manager: ${builtins.toJSON (sorted cfg-sm-medium.nixvault.manifestCategories)}, NixOS: ${builtins.toJSON (sorted cfg-medium.nixvault.manifestCategories)}")
+
+    (check "backend-parity/budgetMiB-matches"
+      (cfg-sm-small.nixvault.budgetMiB == cfg-small.nixvault.budgetMiB
+        && cfg-sm-medium.nixvault.budgetMiB == cfg-medium.nixvault.budgetMiB)
+      "system-manager small=${toString cfg-sm-small.nixvault.budgetMiB}/medium=${toString cfg-sm-medium.nixvault.budgetMiB}, NixOS small=${toString cfg-small.nixvault.budgetMiB}/medium=${toString cfg-medium.nixvault.budgetMiB}")
+
+    (check "backend-parity/all-five-tools-present-on-system-manager-too"
+      (lib.all (n: hasTool cfg-sm-small n) toolNames)
+      "missing under system-manager: ${builtins.toJSON (lib.filter (n: !(hasTool cfg-sm-small n)) toolNames)}")
+
+    (check "backend-parity/create-and-update-are-never-systemd-units-under-system-manager-either"
+      (!(cfg-sm-small.systemd.services ? "nixvault-create") && !(cfg-sm-small.systemd.services ? "nixvault-update"))
+      "nixvault-create/nixvault-update must never be reachable from system-manager's systemd surface either -- both need a human-known passphrase")
+
+    (check "backend-parity/assemble-and-verify-timers-render-on-system-manager-too"
+      (cfg-sm-small.systemd.timers ? "nixvault-assemble" && cfg-sm-small.systemd.timers ? "nixvault-verify")
+      "system-manager timers: ${builtins.toJSON (lib.attrNames cfg-sm-small.systemd.timers)}")
+  ];
 
   results = [
     # --- 1. no default is a hard failure, never a silent guess ---------------------------------
@@ -174,7 +222,8 @@ let
     (check "warnings/in-tier-source-is-silent"
       (cfg-nowarn.warnings == [ ])
       "warnings: ${builtins.toJSON cfg-nowarn.warnings}")
-  ];
+  ]
+  ++ backendParityChecks;
 
   failed = builtins.filter (r: !r.ok) results;
 
@@ -195,4 +244,11 @@ else {
       echo "all $passedCount nixvault eval tests passed"
       touch $out
     '';
+
+  # The one REAL runtime test: a pkgs.testers.nixosTest, the house pattern nixram's
+  # swappiness-relief-vm-test.nix and nixrescue's checks/ already proved out in this repo family --
+  # see that file's own header for exactly what it exercises and why.
+  lifecycle-vm-test = import ./lifecycle-vm-test.nix {
+    inherit pkgs nixvaultModule;
+  };
 }

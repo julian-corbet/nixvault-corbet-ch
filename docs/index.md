@@ -48,32 +48,57 @@ trade does not survive contact.
 3. The passphrase slot is verified, then the temporary random-key slot is
    removed. The passphrase is now the *only* way in.
 
-**UPDATE MANY** times after that (`nixvault-assemble` then
-`nixvault-update`), and this needs no *new* secret:
+**UPDATE MANY** times after that, and this is where ASSEMBLE and COMMIT
+genuinely split — not two names for the same idempotent action:
 
 1. `nixvault-assemble` stages the manifest and builds a squashfs image
    without touching the LUKS container at all — no passphrase involved,
    safe to run on a timer, unattended.
-2. `nixvault-update` opens the container — the operator types the *same*
-   passphrase they already know, an ordinary unlock, not a new secret being
-   generated or managed — writes the fresh image straight into the mapper
-   device, and closes it again. The container is never reformatted; only its
-   contents change.
+2. `nixvault-update` is the *only* tool that ever writes into the container.
+   It opens the container — the operator types the *same* passphrase they
+   already know, an ordinary unlock, not a new secret being generated or
+   managed — writes the fresh image straight into the mapper device, and
+   closes it again. The container is never reformatted; only its contents
+   change.
+
+`luksOpen` needs its passphrase every single time — there is no such thing
+as an unattended one — so committing is, and must stay, a deliberate human
+act, never a timer. (An earlier draft of this design claimed updates need
+"no secret at all: `luksOpen` → `dd` → `luksClose`". That is false, and
+was caught and corrected while this module was actually being built — see
+the fleet's own `nixrescue.md` §7.3 for the record of that correction.)
 
 This is why they are two different tools instead of one idempotent one: they
 have a fundamentally different relationship to the passphrase. Create mints
 one; update merely uses one that already exists.
 
-## Staleness is not cosmetic
+## Staleness is not cosmetic, and neither is drift
 
 A header backup or a key that predates a passphrase change looks exactly
-like a working recovery path and is not one. `nixvault-verify` tracks two
-plain timestamps that need no passphrase to read — when content was last
-staged, and when it was last actually written into the container — and warns
-once either drifts past `nixvault.staleness.maxAgeDays`. The alert channel
-itself (`staleness.alertCommand`) is a deliberate escape hatch: a public
-module cannot know which fleet's paging system to call, so it only logs by
-default and leaves the real channel to the consuming host's own config.
+like a working recovery path and is not one. `nixvault-verify` is the
+unattended **compare-and-alert** step this lifecycle actually needs: it
+tracks two plain timestamps that need no passphrase to read — when content
+was last staged, and when it was last actually committed — warning once
+either drifts past `nixvault.staleness.maxAgeDays`, *and* it compares the
+squashfs `nixvault-assemble` just staged against what `nixvault-update` last
+actually wrote into the container.
+
+That second check cannot literally open the container to look — that would
+need the passphrase, defeating the entire point of running it from a timer.
+Instead, `nixvault-assemble` leaves a plaintext sha256 fingerprint of every
+image it stages, and `nixvault-update` stamps that same digest as
+"committed" the moment it actually writes one in. As long as
+`nixvault-update` is the only path that ever writes the container (which
+`nixvault-create`'s refusal to reformat an existing one guarantees), staged
+== committed is an exact, secret-free proxy for "the container already holds
+the current manifest". A mismatch means the manifest moved on since the last
+commit — content drift, not merely age — and `nixvault-verify` says exactly
+what to do about it: run `nixvault-update`.
+
+The alert channel itself (`staleness.alertCommand`) is a deliberate escape
+hatch: a public module cannot know which fleet's paging system to call, so
+it only logs by default and leaves the real channel to the consuming host's
+own config.
 
 ## Offsite copies are different
 
