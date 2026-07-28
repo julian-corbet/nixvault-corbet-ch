@@ -51,15 +51,17 @@ trade does not survive contact.
 **UPDATE MANY** times after that, and this is where ASSEMBLE and COMMIT
 genuinely split — not two names for the same idempotent action:
 
-1. `nixvault-assemble` stages the manifest and builds a squashfs image
+1. `nixvault-assemble` stages the manifest into a plain directory tree
    without touching the LUKS container at all — no passphrase involved,
    safe to run on a timer, unattended.
 2. `nixvault-update` is the *only* tool that ever writes into the container.
    It opens the container — the operator types the *same* passphrase they
    already know, an ordinary unlock, not a new secret being generated or
-   managed — writes the fresh image straight into the mapper device, and
-   closes it again. The container is never reformatted; only its contents
-   change.
+   managed — mounts the f2fs filesystem already inside it, `rsync`s the
+   staged tree in so only files that actually changed are written, releases
+   the compression blocks that write reserved, and closes it again. Neither
+   the container nor its filesystem is ever reformatted; only the files that
+   changed are rewritten.
 
 `luksOpen` needs its passphrase every single time — there is no such thing
 as an unattended one — so committing is, and must stay, a deliberate human
@@ -72,6 +74,36 @@ This is why they are two different tools instead of one idempotent one: they
 have a fundamentally different relationship to the passphrase. Create mints
 one; update merely uses one that already exists.
 
+## Why f2fs, not squashfs
+
+The vault typically lives on a really slow USB stick. An earlier version of
+this module formatted the container as an immutable squashfs image, rebuilt
+whole and `dd`'d in whole on every commit — several GiB rewritten over slow
+flash for a change of a few kilobytes. The container is a compressed,
+read-write f2fs filesystem instead: formatted once, at `nixvault-create`
+time, then synced into incrementally by `rsync` on every `nixvault-update`
+after that, so a commit only ever writes the files that actually changed.
+
+f2fs's own compression mount recipe is vendored, not invented, from a sibling
+project's field-proven store recipe (`lib/f2fs-vault-opts.nix`). f2fs is the
+right choice here even though that sibling's own rescue image deliberately
+rejected it for its own store: f2fs's fs-mode compression reserves
+*uncompressed* blocks until an explicit release pass runs, which is a real
+problem when ingesting a whole closure in one shot into a tight partition —
+but this vault is the opposite shape of write, a small payload landing on a
+device with roughly ten times the headroom, written incrementally with a
+release pass after every commit. Compression here is a write-speed win
+against slow flash, never a capacity one — CPU time is nearly free by
+comparison, so it must never be "optimised away" in the name of simplicity.
+
+f2fs's release/reserve block accounting only becomes correct on kernel
+≥ 6.12. A sibling project gets that floor for free from an unrelated
+dependency; nixvault has no such freebie, so it checks the running kernel
+explicitly, by name, immediately before it ever formats or mounts the
+filesystem — a runtime check rather than a Nix `assertions` entry, because
+this module is exported unchanged to both NixOS and system-manager, and
+system-manager owns no `boot.kernelPackages` to assert against at eval time.
+
 ## Staleness is not cosmetic, and neither is drift
 
 A header backup or a key that predates a passphrase change looks exactly
@@ -79,21 +111,23 @@ like a working recovery path and is not one. `nixvault-verify` is the
 unattended **compare-and-alert** step this lifecycle actually needs: it
 tracks two plain timestamps that need no passphrase to read — when content
 was last staged, and when it was last actually committed — warning once
-either drifts past `nixvault.staleness.maxAgeDays`, *and* it compares the
-squashfs `nixvault-assemble` just staged against what `nixvault-update` last
-actually wrote into the container.
+either drifts past `nixvault.staleness.maxAgeDays`, *and* it compares a
+content fingerprint of the manifest tree `nixvault-assemble` just staged
+against what `nixvault-update` last actually wrote into the container.
 
 That second check cannot literally open the container to look — that would
 need the passphrase, defeating the entire point of running it from a timer.
-Instead, `nixvault-assemble` leaves a plaintext sha256 fingerprint of every
-image it stages, and `nixvault-update` stamps that same digest as
-"committed" the moment it actually writes one in. As long as
-`nixvault-update` is the only path that ever writes the container (which
-`nixvault-create`'s refusal to reformat an existing one guarantees), staged
-== committed is an exact, secret-free proxy for "the container already holds
-the current manifest". A mismatch means the manifest moved on since the last
-commit — content drift, not merely age — and `nixvault-verify` says exactly
-what to do about it: run `nixvault-update`.
+Instead, `nixvault-assemble` leaves a plaintext content fingerprint (every
+file's path and content hash, folded into one digest) of the tree it just
+staged, and `nixvault-update` computes the same kind of fingerprint fresh
+from what is actually now inside the mounted container and stamps that as
+"committed" the moment it finishes. As long as `nixvault-update` is the only
+path that ever writes the container (which `nixvault-create`'s refusal to
+reformat an existing one guarantees), staged == committed is an exact,
+secret-free proxy for "the container already holds the current manifest". A
+mismatch means the manifest moved on since the last commit — content drift,
+not merely age — and `nixvault-verify` says exactly what to do about it: run
+`nixvault-update`.
 
 The alert channel itself (`staleness.alertCommand`) is a deliberate escape
 hatch: a public module cannot know which fleet's paging system to call, so

@@ -1,8 +1,8 @@
 # nixvault
 
-**A passphrase-only, per-host disaster-recovery vault — LUKS → squashfs,
-built on the host it protects, with no TPM, no keyfile, and no machine
-binding.**
+**A passphrase-only, per-host disaster-recovery vault — LUKS → a compressed,
+read-write f2fs filesystem, built on the host it protects, with no TPM, no
+keyfile, and no machine binding.**
 
 ## What nixvault is
 
@@ -35,14 +35,17 @@ passphrase:
   the container with a random, disposable master key, then immediately runs
   one `luksAddKey` where the operator types their own passphrase, locally.
   That passphrase never touches the network, a build host, or sops.
-- **`nixvault-assemble`** — stages the manifest and builds the squashfs
-  image. Touches no LUKS container at all, needs no passphrase, and is safe
-  to run on a timer, unattended.
+- **`nixvault-assemble`** — stages the manifest into a plain directory tree.
+  Touches no LUKS container at all, needs no passphrase, and is safe to run
+  on a timer, unattended.
 - **`nixvault-update`** — the ONLY tool that ever writes into the container.
   Opens it with the operator's existing passphrase (an ordinary unlock, not
   a new secret) — `luksOpen` needs its passphrase every time, so this step
-  can never be unattended, on purpose — writes the fresh image in, and
-  closes it. The container is never reformatted; only its contents change.
+  can never be unattended, on purpose — mounts the vault's own f2fs
+  filesystem and `rsync`s the staged tree in, so only files that actually
+  changed are ever written, then releases the compression blocks that write
+  reserved and closes the container again. Neither the container nor its
+  filesystem is ever reformatted; only the files that changed are rewritten.
 - **`nixvault-verify`** — the unattended compare-and-alert step: warns if
   either the staged image or the on-disk vault contents have gone stale
   (`staleness.maxAgeDays`), *and* compares a plaintext fingerprint of what
@@ -56,6 +59,31 @@ passphrase:
   for why an offsite copy cannot carry the same keyslot the local container
   does.
 
+## Why f2fs, not squashfs
+
+The vault typically lives on a really slow USB stick. An earlier version of
+this module formatted the container as an immutable squashfs image, rebuilt
+whole and `dd`'d in whole on every commit — several GiB rewritten over slow
+flash for a change of a few kilobytes of runbook text. The container is now
+a compressed, read-write f2fs filesystem instead: formatted once at
+`nixvault-create` time, then synced into incrementally by `rsync` on every
+`nixvault-update` after that, so a commit only ever writes the files that
+actually changed.
+
+f2fs's compression mount recipe is vendored, not invented, from the sibling
+[nixnas](https://github.com/julian-corbet/nixnas-corbet-ch) project's own
+field-proven store recipe — see `lib/f2fs-vault-opts.nix`. f2fs is the right
+choice here even though nixnas's own rescue SLOT deliberately rejected it:
+f2fs's fs-mode compression reserves *uncompressed* blocks until an explicit
+release pass runs, which is a real problem when ingesting a whole closure in
+one shot into a tight partition — but this vault is the opposite shape of
+write, a small payload landing on a device with roughly ten times the
+headroom, written incrementally with a release pass after every commit.
+Compression here is a write-speed win against slow flash, never a capacity
+one — CPU time is nearly free by comparison. See `modules/nixvault.nix`'s own
+header for the full reasoning, including the kernel floor (≥ 6.12) f2fs's
+release/reserve block accounting needs.
+
 ## Status
 
 The module, manifest, and lifecycle tools are complete, exported for both
@@ -64,7 +92,9 @@ eval-time tests and a real `pkgs.testers.nixosTest` runtime harness
 (`checks/lifecycle-vm-test.nix`) that exercises the whole
 create → assemble → commit → drift-detect round trip against a real LUKS
 container on a loopback file, including both failing directions (a wrong
-passphrase, a stale/drifted vault).
+passphrase, a stale/drifted vault) and a measured proof that a second commit
+touching one small file writes materially less than the first commit of the
+whole manifest — see "Why f2fs, not squashfs" below.
 
 ## Two backends, one file
 
@@ -130,7 +160,7 @@ $ sudo nixvault-update
 ```
 
 `nixvault-assemble` also runs automatically on a timer
-(`nixvault.schedule.onCalendar`, default `daily`) so the staged image never
+(`nixvault.schedule.onCalendar`, default `daily`) so the staged manifest never
 drifts far behind `nixvault.sources.*`; `nixvault-update` is never automated,
 on purpose, because it needs the operator's passphrase.
 
@@ -141,6 +171,7 @@ on purpose, because it needs the operator's passphrase.
 | `flake.nix` | Flake entry point: `nixosModules.default` / `systemManagerModules.default` (the same file, both backends), and `lib.manifest`. |
 | `modules/nixvault.nix` | The module: options, assertions, and the five lifecycle tools. |
 | `lib/manifest.nix` | Pure data: the tiers, their size budgets, and the manifest categories each one packs. |
+| `lib/f2fs-vault-opts.nix` | The f2fs mkfs/mount recipe, vendored from the sibling nixnas project — see the module header. |
 | `checks/` | Eval-time tests (including NixOS/system-manager backend parity) plus the real `pkgs.testers.nixosTest` lifecycle harness, all wired into `nix flake check`. |
 | `docs/index.md` | The design walkthrough: why passphrase-only, the create/update split, staleness, and the offsite-copy boundary. |
 | `experiments/` | Runnable trials with recorded results — see [`experiments/README.md`](experiments/README.md). |
@@ -153,11 +184,14 @@ Part of the same small, independently-usable NixOS module family:
 pattern this project's own `checks/lifecycle-vm-test.nix` copies),
 [nixfs](https://github.com/julian-corbet/nixfs-corbet-ch) (the data/module
 split this project's `lib/manifest.nix` follows, and the "one file, both
-backends" export shape this project's own dual-backend export copies), and
+backends" export shape this project's own dual-backend export copies),
 [nixboot](https://github.com/julian-corbet/nixboot-corbet-ch) (the
-prose-option, one-knob-one-owner house style). nixvault has no dependency on
-any of them — it is built to sit in front of any host, independent of
-whatever rescue layer or boot stance that host uses.
+prose-option, one-knob-one-owner house style), and
+[nixnas](https://github.com/julian-corbet/nixnas-corbet-ch) (the field-proven
+f2fs compression recipe `lib/f2fs-vault-opts.nix` vendors — see "Why f2fs,
+not squashfs" above). nixvault has no dependency on any of them — it is built
+to sit in front of any host, independent of whatever rescue layer or boot
+stance that host uses.
 
 ## License
 

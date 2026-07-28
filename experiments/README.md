@@ -5,7 +5,7 @@ directory with a README stating hypothesis, method, and outcome.
 Cross-linked from [`studies/`](../studies/README.md) where a study motivated
 it.
 
-One experiment settled; two candidates remain open.
+Two experiments settled; one candidate remains open.
 
 ## 001 — a `pkgs.testers.nixosTest` covering the full lifecycle end to end — SETTLED
 
@@ -34,16 +34,45 @@ it). Same house pattern as
 [nixrescue](https://github.com/julian-corbet/nixrescue-corbet-ch)'s
 `checks/rescue-vm-test.nix`.
 
-**Outcome:** all thirteen subtests pass. The design correction in the
+**Outcome:** all fourteen subtests pass. The design correction in the
 sealed record this module implements — `luksOpen` needs its passphrase every
 time, so a vault refresh cannot be unattended — was already built correctly
 before that record caught up; what this experiment actually found missing
 was the **compare** step: `nixvault-verify` tracked staleness by age alone
 and had no way to detect that the manifest had moved on since the last
 commit. Fixed by having `nixvault-assemble` and `nixvault-update` each stamp
-a plaintext sha256 fingerprint (staged vs. committed) that `nixvault-verify`
+a plaintext content fingerprint (staged vs. committed) that `nixvault-verify`
 diffs — no passphrase needed to compare, only to act on what the compare
-finds.
+finds. (Originally run against a squashfs image; the container has since
+moved to a mounted f2fs filesystem — see experiment 002 — and this test was
+updated in place rather than superseded, since the lifecycle it proves did
+not change.)
+
+## 002 — incremental f2fs commits write only what changed, measured — SETTLED
+
+**Hypothesis:** replacing the whole-volume squashfs rewrite with an
+incremental `rsync` into a mounted f2fs filesystem actually reduces bytes
+written on a commit that only changes a small file, not merely in theory —
+provable only by measuring real write volume, never by asserting the design
+should work.
+
+**Method:** extended `checks/lifecycle-vm-test.nix` with a large,
+incompressible "bulk" file that sits in the manifest throughout and is never
+touched after its first commit. The vault's LUKS container backing file's
+allocated-block count (`stat -c%b`, the kernel's own real-usage accounting)
+is measured immediately either side of two commits: the first, of the whole
+manifest including the bulk file; the second, changing only a few bytes of
+the runbook. `nodiscard` (carried in `lib/f2fs-vault-opts.nix`) keeps freed
+blocks from being punched back to sparse holes, which is what makes an
+allocated-block delta a faithful proxy for real bytes written to the block
+layer for that specific commit.
+
+**Outcome:** the first commit's delta comfortably exceeds the 8 MiB bulk
+file's size; the second commit's delta is a small fraction of the first's
+and stays under an absolute few-MiB ceiling, even though nothing in either
+commit's assertions or command sequence changed except which files actually
+differed since the last commit. Confirms the incremental-commit design
+change delivers what it was built for, not merely that it was implemented.
 
 ## Open candidates
 
@@ -51,7 +80,3 @@ finds.
   low-entropy human passphrase, confirming the re-wrap genuinely removes that
   keyslot (`cryptsetup luksDump` before/after) rather than merely appearing
   to from the command's own output.
-- A timing measurement of `mksquashfs -Xcompression-level 22` against the
-  `medium` tier's real 4 GiB budget once a real manifest exists, to confirm
-  the packing pipeline stays fast enough to run on every `nixvault-assemble`
-  timer firing rather than only being acceptable as a one-off.

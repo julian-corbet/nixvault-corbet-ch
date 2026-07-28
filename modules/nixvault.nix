@@ -7,7 +7,7 @@
 # for the one artifact whose entire job is surviving the day a machine's own unlock path is gone --
 # a dead mainboard takes its TPM with it; a firmware update invalidates a PCR-sealed keyslot; the
 # laptop you actually have with you is not the one that sealed the container. A vault is the answer:
-# LUKS -> squashfs, built on the host that will carry it, opened with nothing but a passphrase the
+# LUKS -> f2fs, built on the host that will carry it, opened with nothing but a passphrase the
 # operator already knows, so it opens anywhere -- a replacement board, a borrowed machine, wherever
 # the recovery is actually happening.
 #
@@ -19,6 +19,49 @@
 # plain-text runbook readable with nothing but `cat`; and, only once all of that is covered, a
 # curated slice of the operator's own knowledge tree. See lib/manifest.nix for the full category
 # list and which tier packs which.
+#
+# WHY F2FS, NOT SQUASHFS -- an earlier version of this module formatted the container as an
+# immutable squashfs image, rebuilt whole and `dd`'d in whole on every commit. That was wrong for
+# the one fact that actually matters about this vault's hardware: it lives on a REALLY slow USB
+# stick. Rewriting several GiB of squashfs over slow flash for a change of a few kilobytes of
+# runbook text is exactly backwards. The container is now a compressed, read-write f2fs
+# filesystem instead, formatted ONCE at `nixvault-create` time (the same one-time act as the LUKS
+# format it rides alongside) and synced into incrementally by every `nixvault-update` after that --
+# see THE LIFECYCLE below for what "synced into incrementally" actually means.
+#
+# f2fs's mount recipe (`lib/f2fs-vault-opts.nix`) is VENDORED, not invented, from the sibling
+# nixnas project's own field-proven store recipe (its `modules/lib/f2fs-store-mount-opts.nix` +
+# `modules/boot/disk.nix`'s mkfs invocation, `docs/STORAGE.md` §§4-6) -- and f2fs is the RIGHT
+# choice here even though that sibling's own rescue SLOT deliberately rejected it. The reason it
+# was wrong there is that f2fs's fs-mode compression reserves UNCOMPRESSED blocks until an
+# explicit `release_cblocks` pass runs, which bites hard when ingesting a whole closure in one
+# shot into a partition with almost no headroom to spare. This vault is the opposite shape of
+# write entirely: a small payload (the tier budgets are 500 MiB / 4096 MiB) landing on a device
+# sized with roughly TEN TIMES that headroom, written incrementally -- one changed file at a time
+# -- with a release pass run after every commit, not deferred to some later maintenance window.
+# The accounting gate f2fs's reservation-until-release behavior creates never gets anywhere near
+# full on this container. Do not "fix" this by arguing back to squashfs; the slow-flash problem
+# squashfs actually had (whole-volume rewrites) is the one f2fs solves, and the tight-partition
+# problem f2fs actually had (in the rescue SLOT) simply does not exist here.
+#
+# COMPRESSION HERE IS A WRITE-SPEED WIN, NOT A CAPACITY ONE -- say so here so nobody later
+# "optimises" it away by pointing at the tier budgets and asking why a vault this small needs
+# compression at all. The point was never fitting more into the budget: CPU time spent compressing
+# is nearly free set against how slow the underlying USB flash is, so every byte compression keeps
+# off that flash is a real, measurable time saved on every commit. Do not remove `compress_*` mount
+# options in the name of "simplifying" this module -- that would trade a free win for none.
+#
+# THE KERNEL FLOOR THIS RELIES ON: f2fs's release/reserve `i_blocks` accounting only becomes
+# correct on kernel >= 6.12 (see `docs/STORAGE.md` §5's own citation trail on the sibling project).
+# That project gets this floor for free from an unrelated dependency -- its ZFS pools force a
+# recent-enough kernel regardless of f2fs. nixvault has no such freebie: it is not tied to any
+# other subsystem's kernel cap, so it checks the running kernel explicitly, by name, at the one
+# moment it matters (immediately before `nixvault-create` formats the filesystem, and immediately
+# before `nixvault-update` mounts it) rather than assuming whatever kernel happens to be running
+# is new enough. See the `kernelFloorGuard` script fragment below for why this is a RUNTIME check
+# rather than a Nix `assertions` entry -- the short version: this module owns no `boot.*` surface
+# on either backend it exports to, and system-manager in particular has no `boot.kernelPackages` to
+# assert against at eval time in the first place.
 #
 # PASSPHRASE ONLY. NO TPM. NO KEYFILE. NO MACHINE BINDING. This is decided, not an oversight:
 # TPM-sealed keyslots are bound to firmware measurements that change under routine updates, and a
@@ -35,54 +78,65 @@
 #   the master key from its keyslots), then immediately runs ONE `luksAddKey` where the operator
 #   types their own passphrase, locally, at the console. That passphrase's entire path is: the
 #   operator's head -> that machine's LUKS header. It is never generated by, sent to, or stored on
-#   anything else -- never the network, never a build host, never sops. The temporary random key is
-#   shredded and its keyslot removed once the passphrase slot is confirmed working, so the
-#   passphrase becomes the ONLY way into the container.
+#   anything else -- never the network, never a build host, never sops. Then, still with that same
+#   passphrase, `nixvault-create` opens the container ONE more time and runs `mkfs.f2fs` on it --
+#   the filesystem is formatted exactly once here, the same one-time posture as the LUKS format
+#   itself, never repeated by any later tool. Finally the temporary random key is shredded and its
+#   keyslot removed, so the passphrase becomes the ONLY way into the container.
 #
 #   UPDATE MANY times after that, and this is where ASSEMBLE and COMMIT genuinely split, not two
-#   names for one idempotent action. `nixvault-assemble` stages the manifest and builds a squashfs
-#   image entirely without touching the LUKS container -- no passphrase involved at all, so it is
+#   names for one idempotent action. `nixvault-assemble` stages the manifest into a plain directory
+#   tree entirely without touching the LUKS container -- no passphrase involved at all, so it is
 #   the one part of this lifecycle safe to run unattended, off `schedule.onCalendar`.
 #   `nixvault-update` is the ONLY thing that ever writes into the container: it opens it (the
 #   operator types the SAME passphrase they already know -- a normal unlock, not a new secret being
-#   created or managed), writes the fresh squashfs straight into the mapper device, and closes it
-#   again. Opening a LUKS container needs its passphrase full stop -- there is no such thing as an
-#   unattended `luksOpen` -- so committing is, and must stay, a deliberate human act, never a timer.
-#   The container itself is never reformatted; only its contents change. This is the whole reason
-#   nixvault-create and nixvault-update are two different tools instead of one idempotent one --
-#   they have completely different relationships to the passphrase.
+#   created or managed), mounts the f2fs filesystem already sitting inside it, `rsync`s the staged
+#   tree in -- so only files that actually changed since the last commit are written at all, not
+#   the whole manifest -- runs f2fs's compression release pass so those writes' reserved-but-unused
+#   blocks are freed back to the filesystem, then unmounts and closes it again. Opening a LUKS
+#   container needs its passphrase full stop -- there is no such thing as an unattended `luksOpen`
+#   -- so committing is, and must stay, a deliberate human act, never a timer. The container itself
+#   is never reformatted, and its filesystem is never rebuilt from scratch either; only the files
+#   that changed are ever rewritten. This is the whole reason nixvault-create and nixvault-update
+#   are two different tools instead of one idempotent one -- they have completely different
+#   relationships to the passphrase.
 #
 #   (CORRECTED HERE having once been stated wrong: an earlier draft of the design record this
 #   module implements claimed updates need "no secret at all: luksOpen -> dd -> luksClose". That
 #   is false -- `luksOpen` needs the passphrase every time -- and the record itself now says so;
 #   see nixrescue.md §7.3's own correction. This module was already built the right way round
-#   before that record caught up: assemble unattended, commit attended, never the reverse.)
+#   before that record caught up: assemble unattended, commit attended, never the reverse. That
+#   correction is exactly as true of the f2fs-based commit above as it was of the old dd-a-squashfs
+#   one -- swapping the payload format never touched which half of the lifecycle needs the secret.)
 #
 #   STALENESS IS NOT COSMETIC HERE, and neither is DRIFT. A header backup or key that predates a
 #   passphrase change looks exactly like a working recovery path and is not one. `nixvault-verify`
 #   is the unattended COMPARE + ALERT step the timer actually runs: it re-checks two on-disk
 #   timestamps that need no passphrase to read -- when content was last staged, and when it was
-#   last actually committed -- against `staleness.maxAgeDays`, AND it compares the squashfs
-#   `nixvault-assemble` just staged against what `nixvault-update` last actually wrote into the
-#   container. That second check cannot literally open the container to look (that would need the
-#   passphrase, defeating the point of running it from a timer) -- instead `nixvault-assemble`
-#   leaves a plaintext sha256 of every image it stages, and `nixvault-update` stamps that same
-#   digest as "committed" the moment it writes it in. As long as nixvault-update is the only write
-#   path into the container (nixvault-create refuses to reformat an existing one, so it is), staged
-#   == committed is an exact, secret-free proxy for "the container already holds this". A mismatch
-#   means the manifest has moved on since the last commit -- content drift, not merely age -- and
-#   `nixvault-verify` says so in as many words: run nixvault-update. `staleness.alertCommand` is a
-#   deliberate escape hatch rather than a hardcoded channel: a public module cannot know which
-#   fleet's paging system to call.
+#   last actually committed -- against `staleness.maxAgeDays`, AND it compares a plaintext content
+#   fingerprint of the manifest tree `nixvault-assemble` just staged against what `nixvault-update`
+#   last actually wrote into the container. That second check cannot literally open the container
+#   to look (that would need the passphrase, defeating the point of running it from a timer) --
+#   instead `nixvault-assemble` fingerprints every file path and its content hash in the tree it
+#   just staged, folded into one digest, and `nixvault-update` computes the SAME kind of digest
+#   fresh from what is actually now sitting inside the mounted container and stamps that as
+#   "committed" the moment the commit finishes -- computed from the container's own contents, not
+#   copied from nixvault-assemble's own value, so a bug or a race in staging can't quietly pass
+#   this check. As long as nixvault-update is the only write path into the container (nixvault-create
+#   refuses to reformat an existing one, so it is), staged == committed is an exact, secret-free
+#   proxy for "the container already holds this". A mismatch means the manifest has moved on since
+#   the last commit -- content drift, not merely age -- and `nixvault-verify` says so in as many
+#   words: run nixvault-update. `staleness.alertCommand` is a deliberate escape hatch rather than a
+#   hardcoded channel: a public module cannot know which fleet's paging system to call.
 #
 # THE PACKING PIPELINE (nixvault-assemble): rm -rf the staging directory, re-populate it (generated
 # categories from `cryptsetup luksHeaderBackup` against `nixvault.luksVolumes`; static categories
-# from whatever paths `nixvault.sources.<category>` names), then `mksquashfs -comp zstd
-# -Xcompression-level 22 -b 1M` -- the measured settings that beat both a raw zstd stream and erofs
-# on wall time for this shape of content. The staged image sits in plaintext in `stateDirectory`
-# until `nixvault-update` writes it in; that is a live-host-local duplicate of material this host
-# already holds in plaintext somewhere (the sources it was copied from), not a new exposure, and
-# `stateDirectory` is created 0700 accordingly. It is exactly the reason the staged squashfs must
+# from whatever paths `nixvault.sources.<category>` names). Unlike the old squashfs pipeline,
+# nothing is built here -- the staged directory tree IS the thing `nixvault-update` later `rsync`s
+# into the container, verbatim. The staged tree sits in plaintext in `stateDirectory` until
+# `nixvault-update` syncs it in; that is a live-host-local duplicate of material this host already
+# holds in plaintext somewhere (the sources it was copied from), not a new exposure, and
+# `stateDirectory` is created 0700 accordingly. It is exactly the reason the staging directory must
 # never itself be copied anywhere -- only the LUKS container is meant to travel.
 #
 # OFFSITE COPIES ARE THE ONE PLACE THE PASSPHRASE-ONLY TRADE DOES NOT SURVIVE CONTACT. Because
@@ -144,6 +198,27 @@ let
   manifest = import ../lib/manifest.nix { };
   inherit (manifest) tiers tierNames categoryNames staticCategories generatedCategories;
 
+  # The f2fs recipe, vendored unchanged from the sibling nixnas project -- see
+  # lib/f2fs-vault-opts.nix's own header for exactly what each flag does and why.
+  f2fsOpts = import ../lib/f2fs-vault-opts.nix;
+  f2fsMountOptionsStr = lib.concatStringsSep "," f2fsOpts.mountOptions;
+
+  # THE KERNEL FLOOR release_cblocks needs -- see this module's own "THE KERNEL FLOOR" header
+  # section for why this is a runtime check, not a Nix `assertions` entry: this module owns no
+  # `boot.*` surface on either backend it exports to, and system-manager in particular has no
+  # `boot.kernelPackages` to force at eval time. `uname -r` is exactly as meaningful on a foreign
+  # system-manager host as on NixOS -- it names the kernel the script is ACTUALLY about to run
+  # f2fs operations under, which is the only thing that matters here.
+  requiredKernel = "6.12";
+  kernelFloorGuard = ''
+    running_kernel="$(uname -r)"
+    oldest="$(printf '%s\n%s\n' "${requiredKernel}" "$running_kernel" | sort -V | head -n1)"
+    if [ "$oldest" != "${requiredKernel}" ]; then
+      echo "nixvault: running kernel $running_kernel is older than the ${requiredKernel} floor f2fs's compression release/reserve block accounting needs (see this module's own header) -- refusing to format or write into the vault. Boot a ${requiredKernel}+ kernel first." >&2
+      exit 1
+    fi
+  '';
+
   # EVAL SAFETY, same shape as nixram's own `activeLevel`: `nixvault.tier` and `nixvault.device`
   # have no default and can legitimately be null while NixOS forces most of `config` in one pass to
   # build `system.build.toplevel` -- independent of, and possibly before, whichever order
@@ -184,15 +259,28 @@ let
 
   luksVolumeNames = map (v: v.name) cfg.luksVolumes;
 
+  # A content fingerprint of an entire directory tree -- every file's path AND its content hash,
+  # folded into one digest -- needs no LUKS access and no image built first to compute. Shared,
+  # verbatim, between nixvault-assemble (fingerprints the staging directory right after populating
+  # it) and nixvault-update (fingerprints the mounted container right after committing into it):
+  # using the identical function on both sides is what makes staged-hash == committed-hash a
+  # meaningful drift proxy at all, rather than two different notions of "the same" by coincidence.
+  treeHashFn = ''
+    nixvault_tree_hash() {
+      ( cd "$1" && find . -type f -exec sha256sum {} + | sort -k2 | sha256sum | cut -d' ' -f1 )
+    }
+  '';
+
   # ── The scripts ──────────────────────────────────────────────────────────────────────────────
   assembleScript = pkgs.writeShellApplication {
     name = "nixvault-assemble";
-    runtimeInputs = [ pkgs.cryptsetup pkgs.squashfsTools pkgs.coreutils ];
+    runtimeInputs = [ pkgs.cryptsetup pkgs.coreutils pkgs.findutils ];
     text = ''
       set -euo pipefail
 
+      ${treeHashFn}
+
       staging="${cfg.stateDirectory}/stage"
-      out="${cfg.stateDirectory}/vault.squashfs"
 
       install -d -m 0700 "${cfg.stateDirectory}"
       rm -rf "$staging"
@@ -216,45 +304,48 @@ let
         ${lib.concatMapStringsSep "\n" (src: ''cp -a --no-preserve=ownership "${src}" "$staging/${cat}/"'') cfg.sources.${cat}}
       '') activeStaticCategories}
 
-      echo "nixvault-assemble: building squashfs (zstd -22, 1M blocks -- the measured house settings)..."
-      rm -f "$out"
-      mksquashfs "$staging" "$out" -noappend -comp zstd -Xcompression-level 22 -b 1M
-      chmod 0600 "$out"
-
       date -u +%s > "${cfg.stateDirectory}/last-assembled-timestamp"
 
-      # A plaintext fingerprint of the image just staged -- needs no passphrase to write or to
-      # read. This is the other half of nixvault-verify's drift check: nixvault-update stamps this
-      # SAME digest as "committed" the moment it actually writes an image into the LUKS container,
-      # so comparing the two lets an unattended timer notice the manifest has moved on since the
-      # last commit without ever opening the container to look.
-      sha256sum "$out" | cut -d' ' -f1 > "${cfg.stateDirectory}/staged-hash"
+      # A plaintext content fingerprint of the manifest tree just staged -- needs no passphrase to
+      # write or to read. This is the other half of nixvault-verify's drift check: nixvault-update
+      # computes the SAME kind of fingerprint fresh from what actually landed inside the container
+      # and stamps THAT as "committed" the moment a commit finishes, so comparing the two lets an
+      # unattended timer notice the manifest has moved on since the last commit without ever
+      # opening the container to look.
+      nixvault_tree_hash "$staging" > "${cfg.stateDirectory}/staged-hash"
 
       budget_bytes=$(( ${toString activeTier.budgetMiB} * 1024 * 1024 ))
-      actual_bytes=$(stat -c%s "$out")
+      actual_bytes=$(du -sb "$staging" | cut -f1)
       if [ "$actual_bytes" -gt "$budget_bytes" ]; then
-        echo "nixvault-assemble: WARNING -- staged image is $actual_bytes bytes, over the '${activeTierName}' tier's own ${toString activeTier.budgetMiB} MiB budget ($budget_bytes bytes). It will still be written if the underlying device is large enough, but the tier no longer describes what this host actually carries." >&2
+        echo "nixvault-assemble: WARNING -- staged manifest is $actual_bytes bytes, over the '${activeTierName}' tier's own ${toString activeTier.budgetMiB} MiB budget ($budget_bytes bytes). It will still be written if the underlying device is large enough, but the tier no longer describes what this host actually carries. This is a RAW byte count -- compression on the vault's f2fs filesystem is a write-speed win, never counted on for capacity here (see this module's own header)." >&2
       fi
 
-      echo "nixvault-assemble: staged $out ($actual_bytes bytes). Run nixvault-update to write it into the LUKS container."
+      echo "nixvault-assemble: staged $staging ($actual_bytes raw bytes). Run nixvault-update to sync it into the vault."
     '';
   };
 
   createScript = pkgs.writeShellApplication {
     name = "nixvault-create";
-    runtimeInputs = [ pkgs.cryptsetup pkgs.coreutils ];
+    runtimeInputs = [ pkgs.cryptsetup pkgs.coreutils pkgs.f2fs-tools ];
     text = ''
       set -euo pipefail
 
       device="${deviceOrPlaceholder}"
+      mapper="${cfg.mapperName}-create"
 
       if cryptsetup isLuks "$device" 2>/dev/null; then
         echo "nixvault-create: $device is already a LUKS container. Refusing to reformat -- this would destroy an existing vault. Use nixvault-update for routine content changes." >&2
         exit 1
       fi
 
+      ${kernelFloorGuard}
+
       tmpkey="$(mktemp)"
-      trap 'shred -u "$tmpkey" 2>/dev/null || rm -f "$tmpkey"' EXIT
+      cleanup() {
+        cryptsetup close "$mapper" 2>/dev/null || true
+        shred -u "$tmpkey" 2>/dev/null || rm -f "$tmpkey"
+      }
+      trap cleanup EXIT
       head -c 64 /dev/urandom > "$tmpkey"
 
       echo "nixvault-create: formatting $device with a random, disposable master key."
@@ -267,67 +358,90 @@ let
       cryptsetup luksAddKey --key-file "$tmpkey" "$device"
 
       echo
-      echo "nixvault-create: confirming the passphrase you just typed actually opens this container..."
-      cryptsetup open --test-passphrase "$device"
+      echo "nixvault-create: opening with the passphrase you just typed -- this both confirms it actually works and lays down the vault's filesystem, which (like the LUKS format itself) only ever happens once:"
+      cryptsetup open "$device" "$mapper"
+
+      echo "nixvault-create: formatting the opened container as f2fs, with compression enabled (a WRITE-SPEED win against slow flash on every future commit, never a capacity one -- see this module's own header for why that must never be \"optimised\" away)..."
+      mkfs.f2fs -f -O ${f2fsOpts.mkfsFeatures} "/dev/mapper/$mapper"
+
+      cryptsetup close "$mapper"
 
       echo "nixvault-create: confirmed. Removing the temporary random-key slot -- the passphrase is now the only way in."
       cryptsetup luksRemoveKey --key-file "$tmpkey" "$device"
 
       echo
-      echo "nixvault-create: done. $device now holds an empty LUKS2 container, unlockable ONLY with the passphrase you just typed -- no TPM, no keyfile, no machine binding, by design (it must open on a replacement mainboard, which is the exact scenario it exists for)."
+      echo "nixvault-create: done. $device now holds an empty, compressed f2fs filesystem inside a LUKS2 container, unlockable ONLY with the passphrase you just typed -- no TPM, no keyfile, no machine binding, by design (it must open on a replacement mainboard, which is the exact scenario it exists for)."
       echo "Next: nixvault-assemble to stage content, then nixvault-update to write it in."
     '';
   };
 
   updateScript = pkgs.writeShellApplication {
     name = "nixvault-update";
-    runtimeInputs = [ pkgs.cryptsetup pkgs.coreutils pkgs.util-linux ];
+    runtimeInputs = [ pkgs.cryptsetup pkgs.coreutils pkgs.util-linux pkgs.rsync pkgs.f2fs-tools pkgs.findutils ];
     text = ''
       set -euo pipefail
 
+      ${treeHashFn}
+
       device="${deviceOrPlaceholder}"
       mapper="${cfg.mapperName}"
-      image="${cfg.stateDirectory}/vault.squashfs"
+      staging="${cfg.stateDirectory}/stage"
 
-      if [ ! -e "$image" ]; then
-        echo "nixvault-update: no staged image at $image -- run nixvault-assemble first." >&2
+      if [ ! -d "$staging" ] || [ ! -e "${cfg.stateDirectory}/staged-hash" ]; then
+        echo "nixvault-update: no staged manifest at $staging -- run nixvault-assemble first." >&2
         exit 1
       fi
+
+      ${kernelFloorGuard}
 
       echo "nixvault-update: opening $device as /dev/mapper/$mapper -- you will be asked for the passphrase."
       cryptsetup open "$device" "$mapper"
 
+      mnt="$(mktemp -d)"
       cleanup() {
+        umount "$mnt" 2>/dev/null || true
+        rmdir "$mnt" 2>/dev/null || true
         cryptsetup close "$mapper" 2>/dev/null || true
       }
       trap cleanup EXIT
 
-      target_size=$(stat -c%s "$image")
-      mapper_size=$(blockdev --getsize64 "/dev/mapper/$mapper")
-      if [ "$target_size" -gt "$mapper_size" ]; then
-        echo "nixvault-update: staged image is $target_size bytes, larger than the container itself ($mapper_size bytes on /dev/mapper/$mapper). Refusing to write -- grow the underlying device or shrink the manifest." >&2
-        exit 1
-      fi
+      echo "nixvault-update: mounting the vault's f2fs filesystem..."
+      mount -t f2fs -o "${f2fsMountOptionsStr}" "/dev/mapper/$mapper" "$mnt"
 
-      echo "nixvault-update: writing $image into /dev/mapper/$mapper ($target_size of $mapper_size bytes)..."
-      dd if="$image" of="/dev/mapper/$mapper" bs=1M conv=fsync status=progress
+      # THE INCREMENTAL COMMIT -- the whole reason this module dropped squashfs (see this file's
+      # own header). Plain rsync (never --inplace: a changed file is written to a NEW temp file
+      # and renamed over the old one, so an already-released compressed file is never rewritten
+      # IN PLACE -- the one write pattern f2fs's release_cblocks leaves EIO/EPERM-blocked, see
+      # lib/f2fs-vault-opts.nix). --checksum, not mtime/size, because a GENERATED category (a
+      # fresh `cryptsetup luksHeaderBackup` run) gets a brand-new mtime on every nixvault-assemble
+      # even when its content has not actually changed -- mtime-based comparison would wrongly
+      # treat that as a change and rewrite it every single commit, defeating the entire point.
+      echo "nixvault-update: syncing the staged manifest in -- only files that actually changed are written..."
+      rsync -a --delete --checksum "$staging"/ "$mnt"/
+
+      echo "nixvault-update: releasing this commit's reserved-but-unused compressed blocks back to the filesystem (idempotent -- already-released files are a harmless no-op; see lib/f2fs-vault-opts.nix)..."
+      sync
+      find "$mnt" -xdev -type f -print0 | xargs -0 -r -n1 f2fs_io release_cblocks >/dev/null 2>&1 || true
       sync
 
-      cryptsetup close "$mapper"
-      trap - EXIT
-
-      date -u +%s > "${cfg.stateDirectory}/last-written-timestamp"
-
-      # Stamp what was ACTUALLY committed, in plaintext, next to the timestamp above -- computed
-      # fresh from $image rather than trusted from nixvault-assemble's own staged-hash file, so this
-      # is correct even if something else produced $image. This is the other half of
+      # Stamp what was ACTUALLY committed, in plaintext, computed fresh from the mounted
+      # container's own contents -- not copied from nixvault-assemble's own staged-hash value, so
+      # this is correct even if something else touched $mnt. This is the other half of
       # nixvault-verify's drift check (see nixvault-assemble): as long as this tool is the only
       # thing that ever writes the container -- which nixvault-create's reformat refusal
       # guarantees -- staged-hash == committed-hash is an exact, secret-free proxy for "the
       # container already holds this manifest".
-      sha256sum "$image" | cut -d' ' -f1 > "${cfg.stateDirectory}/committed-hash"
+      committed_hash="$(nixvault_tree_hash "$mnt")"
 
-      echo "nixvault-update: done. $device now carries the freshly assembled vault contents. The container itself was never reformatted -- only its contents changed."
+      umount "$mnt"
+      rmdir "$mnt"
+      cryptsetup close "$mapper"
+      trap - EXIT
+
+      date -u +%s > "${cfg.stateDirectory}/last-written-timestamp"
+      echo "$committed_hash" > "${cfg.stateDirectory}/committed-hash"
+
+      echo "nixvault-update: done. $device now carries the freshly synced vault contents. Neither the LUKS container nor its f2fs filesystem was reformatted -- only the files that changed were ever rewritten."
     '';
   };
 
@@ -356,25 +470,26 @@ let
         fi
       }
 
-      check_age "${cfg.stateDirectory}/last-assembled-timestamp" "staged vault image (nixvault-assemble)" "${toString cfg.staleness.maxAgeDays}"
+      check_age "${cfg.stateDirectory}/last-assembled-timestamp" "staged vault manifest (nixvault-assemble)" "${toString cfg.staleness.maxAgeDays}"
       check_age "${cfg.stateDirectory}/last-written-timestamp" "on-disk vault contents (nixvault-update)" "${toString cfg.staleness.maxAgeDays}"
 
       # CONTENT DRIFT -- the compare step this lifecycle actually needs (see the module's own
       # "THE LIFECYCLE" header). nixvault-verify cannot open the LUKS container to see what it
       # holds -- that needs the passphrase, and this runs unattended off a timer -- so it compares
-      # plaintext fingerprints instead: nixvault-assemble hashes every squashfs it stages, and
-      # nixvault-update stamps that SAME hash as "committed" the instant it writes one in. Staged
-      # == committed is therefore an exact, secret-free proxy for "the container already holds the
-      # current manifest", true as long as nixvault-update is the only path that ever writes it
-      # (nixvault-create refuses to reformat an existing container, so it is).
+      # plaintext content fingerprints instead: nixvault-assemble fingerprints the manifest tree it
+      # just staged, and nixvault-update stamps the SAME kind of fingerprint -- computed fresh from
+      # what is actually now inside the container -- as "committed" the instant a commit finishes.
+      # Staged == committed is therefore an exact, secret-free proxy for "the container already
+      # holds the current manifest", true as long as nixvault-update is the only path that ever
+      # writes it (nixvault-create refuses to reformat an existing container, so it is).
       staged_hash_file="${cfg.stateDirectory}/staged-hash"
       committed_hash_file="${cfg.stateDirectory}/committed-hash"
       if [ ! -e "$staged_hash_file" ]; then
-        echo "WARN: no staged image yet ($staged_hash_file does not exist) -- run nixvault-assemble first"
+        echo "WARN: no staged manifest yet ($staged_hash_file does not exist) -- run nixvault-assemble first"
         warn=$((warn + 1))
       elif [ ! -e "$committed_hash_file" ]; then
         echo "WARN: this vault's content has never been committed ($committed_hash_file does not exist)"
-        echo "ACTION REQUIRED: run nixvault-update to write the staged image into the LUKS container -- you will be asked for the passphrase."
+        echo "ACTION REQUIRED: run nixvault-update to sync the staged manifest into the vault -- you will be asked for the passphrase."
         warn=$((warn + 1))
       else
         staged_hash=$(cat "$staged_hash_file")
@@ -453,7 +568,7 @@ let
 in
 {
   options.nixvault = {
-    enable = lib.mkEnableOption "a passphrase-only, per-host disaster-recovery vault (LUKS -> squashfs), assembled from a curated manifest and written into a container built on this host";
+    enable = lib.mkEnableOption "a passphrase-only, per-host disaster-recovery vault (LUKS -> f2fs), assembled from a curated manifest and written into a container built on this host";
 
     tier = lib.mkOption {
       type = lib.types.nullOr (lib.types.enum tierNames);
@@ -490,22 +605,22 @@ in
     mapperName = lib.mkOption {
       type = lib.types.str;
       default = "vault";
-      description = "The /dev/mapper/<name> this vault is opened as while nixvault-update writes into it. Only matters while a script in this module is actively running -- the container is closed again before nixvault-update exits.";
+      description = "The /dev/mapper/<name> this vault is opened as while nixvault-update mounts and syncs into it (nixvault-create uses '<name>-create' for its own one-time mkfs pass, so the two never collide). Only matters while a script in this module is actively running -- the container is closed again before either tool exits.";
     };
 
     stateDirectory = lib.mkOption {
       type = lib.types.str;
       default = "/var/lib/nixvault";
       description = ''
-        Where the staged manifest, the built squashfs, the two staleness timestamps, and the two
-        plaintext content fingerprints (staged-hash, committed-hash -- see nixvault-verify's own
-        drift check) live on this host. Created 0700: the staging directory holds a plaintext
-        duplicate of everything the vault will eventually carry, including the sops age keys and
-        the Secure Boot PKI, before nixvault-update encrypts it into the container. That duplicate
-        adds no new exposure beyond normal root-on-this-host scope -- the same material already
-        sits in plaintext wherever nixvault.sources.* points at -- but it must never itself be the
-        thing that leaves this machine. Only the LUKS container is meant to travel. The two
-        sha256 fingerprints carry no secret material at all -- they identify content, not open it.
+        Where the staged manifest tree, the two staleness timestamps, and the two plaintext content
+        fingerprints (staged-hash, committed-hash -- see nixvault-verify's own drift check) live on
+        this host. Created 0700: the staging directory holds a plaintext duplicate of everything the
+        vault will eventually carry, including the sops age keys and the Secure Boot PKI, before
+        nixvault-update `rsync`s it into the container. That duplicate adds no new exposure beyond
+        normal root-on-this-host scope -- the same material already sits in plaintext wherever
+        nixvault.sources.* points at -- but it must never itself be the thing that leaves this
+        machine. Only the LUKS container is meant to travel. The two sha256-derived fingerprints
+        carry no secret material at all -- they identify content, not open it.
       '';
     };
 
@@ -545,7 +660,7 @@ in
     assemble.enable = lib.mkOption {
       type = lib.types.bool;
       default = true;
-      description = "Run nixvault-assemble automatically on a timer (and once at boot), so the staged squashfs never drifts far from nixvault.sources.* and nixvault.luksVolumes. Turn off on a host that stages the manifest by some other means, or that wants full manual control over when assembly happens. Never affects nixvault-update, which always requires the operator to run it, on purpose.";
+      description = "Run nixvault-assemble automatically on a timer (and once at boot), so the staged manifest never drifts far from nixvault.sources.* and nixvault.luksVolumes. Turn off on a host that stages the manifest by some other means, or that wants full manual control over when assembly happens. Never affects nixvault-update, which always requires the operator to run it, on purpose.";
     };
 
     staleness.maxAgeDays = lib.mkOption {
@@ -584,7 +699,7 @@ in
     budgetMiB = lib.mkOption {
       type = lib.types.ints.positive;
       readOnly = true;
-      description = "The selected tier's size budget in MiB, resolved from lib/manifest.nix. Informational, and used by nixvault-assemble's own post-build size warning -- never enforced at eval time, since mksquashfs's real output size isn't knowable until the content actually exists.";
+      description = "The selected tier's size budget in MiB, resolved from lib/manifest.nix. Informational, and used by nixvault-assemble's own post-staging size warning -- never enforced at eval time, since the manifest's real size isn't knowable until the content actually exists. A raw byte count, not a compressed one -- see this module's own header for why compression is a write-speed win here, never counted on for capacity.";
     };
   };
 
@@ -630,7 +745,7 @@ in
     # anything else that could run unattended.
 
     systemd.services.nixvault-assemble = lib.mkIf cfg.assemble.enable {
-      description = "nixvault: stage the manifest and build the squashfs image (no LUKS container touched)";
+      description = "nixvault: stage the manifest into a plain directory tree (no LUKS container touched)";
       wantedBy = [ "multi-user.target" ];
       after = [ "local-fs.target" ];
       serviceConfig = {
@@ -648,7 +763,7 @@ in
     };
 
     systemd.services.nixvault-verify = {
-      description = "nixvault: warn if the staged image or the on-disk vault contents are stale, or if the manifest has drifted from what is committed";
+      description = "nixvault: warn if the staged manifest or the on-disk vault contents are stale, or if the manifest has drifted from what is committed";
       wantedBy = [ "multi-user.target" ];
       after = [ "nixvault-assemble.service" ];
       serviceConfig = {

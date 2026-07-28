@@ -1,5 +1,5 @@
 {
-  description = "nixvault -- a passphrase-only, per-host disaster-recovery vault (LUKS -> squashfs), assembled from a curated manifest and built on the host it protects";
+  description = "nixvault -- a passphrase-only, per-host disaster-recovery vault (LUKS -> f2fs), assembled from a curated manifest and built on the host it protects";
 
   inputs = {
     # Used by `checks` only. The module itself takes `pkgs` from the consuming evaluation and never
