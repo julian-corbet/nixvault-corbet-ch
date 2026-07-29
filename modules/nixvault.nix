@@ -95,7 +95,15 @@
 #   the whole manifest -- runs f2fs's compression release pass so those writes' reserved-but-unused
 #   blocks are freed back to the filesystem, then unmounts and closes it again. Opening a LUKS
 #   container needs its passphrase full stop -- there is no such thing as an unattended `luksOpen`
-#   -- so committing is, and must stay, a deliberate human act, never a timer. The container itself
+#   for a container NOTHING ELSE HAS OPENED. That qualifier matters, and an earlier draft of this
+#   header missed it: on a host whose initrd already unlocks every declared LUKS member from ONE
+#   operator passphrase (the kernel keyring caches it across the set), the vault can be declared
+#   as one more member and is open before userspace exists. `nixvault-update` adopts such a mapper
+#   instead of re-prompting, and closes only what it opened itself. The human act is then the ONE
+#   passphrase entry at boot -- which is the point; re-prompting for an already-open container is
+#   not extra security, it is a second tax on the same decision, and it is exactly what would
+#   block an unattended assemble->commit lifecycle on such a host. Committing remains a deliberate
+#   act either way. The container itself
 #   is never reformatted, and its filesystem is never rebuilt from scratch either; only the files
 #   that changed are ever rewritten. This is the whole reason nixvault-create and nixvault-update
 #   are two different tools instead of one idempotent one -- they have completely different
@@ -394,14 +402,37 @@ let
 
       ${kernelFloorGuard}
 
-      echo "nixvault-update: opening $device as /dev/mapper/$mapper -- you will be asked for the passphrase."
-      cryptsetup open "$device" "$mapper"
+      # ADOPT AN ALREADY-OPEN CONTAINER RATHER THAN DEMANDING THE PASSPHRASE AGAIN.
+      #
+      # "There is no such thing as an unattended luksOpen" (this file's header) is true
+      # of a container nothing else has opened -- and misses the deployment this vault
+      # is actually built for. On a host whose initrd already unlocks every declared
+      # LUKS member from ONE operator passphrase (the kernel keyring caches it across
+      # the whole set), the vault can be declared as one more member. It is then open
+      # before userspace exists, and this tool has nothing left to unlock.
+      #
+      # That is the difference between "committing must be a deliberate human act" --
+      # true, and unchanged -- and "committing must re-prompt". The human act is the
+      # ONE passphrase entry at boot. Re-prompting for a container that is already open
+      # is not extra security, it is a second tax on the same decision, and it is what
+      # blocks the whole unattended assemble->commit lifecycle on such a host.
+      #
+      # WE CLOSE ONLY WHAT WE OPENED. Tearing down a mapper this tool did not create
+      # would yank the vault out from under whatever else opened it.
+      opened_here=0
+      if [ -e "/dev/mapper/$mapper" ]; then
+        echo "nixvault-update: /dev/mapper/$mapper is already open (initrd or a prior unlock) -- adopting it, no passphrase needed."
+      else
+        echo "nixvault-update: opening $device as /dev/mapper/$mapper -- you will be asked for the passphrase."
+        cryptsetup open "$device" "$mapper"
+        opened_here=1
+      fi
 
       mnt="$(mktemp -d)"
       cleanup() {
         umount "$mnt" 2>/dev/null || true
         rmdir "$mnt" 2>/dev/null || true
-        cryptsetup close "$mapper" 2>/dev/null || true
+        [ "$opened_here" = 1 ] && cryptsetup close "$mapper" 2>/dev/null || true
       }
       trap cleanup EXIT
 
@@ -663,6 +694,27 @@ in
       description = "Run nixvault-assemble automatically on a timer (and once at boot), so the staged manifest never drifts far from nixvault.sources.* and nixvault.luksVolumes. Turn off on a host that stages the manifest by some other means, or that wants full manual control over when assembly happens. Never affects nixvault-update, which always requires the operator to run it, on purpose.";
     };
 
+    commit.enable = lib.mkOption {
+      type = lib.types.bool;
+      default = false;
+      description = ''
+        Run nixvault-update automatically on a timer, committing the staged manifest into
+        the vault without an operator present.
+
+        OFF by default, and only correct on a host where the vault's LUKS container is
+        ALREADY OPEN -- i.e. one whose initrd unlocks every declared member from a single
+        operator passphrase, with the vault declared as one of them. There, the human act
+        is the one passphrase entry at boot, and re-prompting per commit is a second tax
+        on the same decision.
+
+        On any other host this timer is useless rather than dangerous: nixvault-update
+        refuses to prompt from a unit with no console and exits non-zero, so the commit
+        simply does not happen and the failure is visible. It can never silently write a
+        vault the operator did not authorise, and it never opens the container itself --
+        it only adopts one that is already open.
+      '';
+    };
+
     staleness.maxAgeDays = lib.mkOption {
       type = lib.types.ints.positive;
       default = 30;
@@ -755,6 +807,30 @@ in
     };
 
     systemd.timers.nixvault-assemble = lib.mkIf cfg.assemble.enable {
+      wantedBy = [ "timers.target" ];
+      timerConfig = {
+        OnCalendar = cfg.schedule.onCalendar;
+        Persistent = true;
+      };
+    };
+
+    # Unattended commit -- ONLY meaningful where the container is already open (see
+    # commit.enable). The unit deliberately does NOT provide a passphrase by any means:
+    # if the mapper is absent, nixvault-update's own `cryptsetup open` has no console,
+    # fails, and the unit fails loudly. That is the intended behaviour -- a missing
+    # unlock must surface, never be worked around with a keyfile.
+    systemd.services.nixvault-commit = lib.mkIf cfg.commit.enable {
+      description = "nixvault: commit the staged manifest into the (already-open) vault";
+      after = [ "nixvault-assemble.service" "local-fs.target" ];
+      wants = [ "nixvault-assemble.service" ];
+      serviceConfig = {
+        Type = "oneshot";
+        ExecStart = "${updateScript}/bin/nixvault-update";
+        StandardInput = "null";
+      };
+    };
+
+    systemd.timers.nixvault-commit = lib.mkIf cfg.commit.enable {
       wantedBy = [ "timers.target" ];
       timerConfig = {
         OnCalendar = cfg.schedule.onCalendar;
