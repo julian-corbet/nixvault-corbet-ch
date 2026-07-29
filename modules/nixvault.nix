@@ -294,7 +294,7 @@ let
       rm -rf "$staging"
       install -d -m 0700 "$staging"
 
-      ${lib.optionalString (activeGeneratedCategories != [ ]) ''
+      ${lib.optionalString (activeGeneratedCategories != [ ] && cfg.luksVolumes != [ ]) ''
         echo "nixvault-assemble: generating LUKS header backups and the device-role map..."
         install -d -m 0700 "$staging/luksHeaderBackups"
         install -d -m 0700 "$staging/deviceRoleMap"
@@ -304,6 +304,32 @@ let
           cryptsetup luksHeaderBackup "${v.device}" --header-backup-file "$staging/luksHeaderBackups/${v.name}.img"
           printf '%s\t%s\n' "${v.name}" "${v.device}" >> "$staging/deviceRoleMap/device-role-map.txt"
         '') cfg.luksVolumes}
+      ''}
+
+      ${lib.optionalString (activeGeneratedCategories != [ ] && cfg.importHeaderBackups != [ ]) ''
+        # IMPORT rather than generate -- this host does not have the disks (see
+        # importHeaderBackups' own description). A missing source is FATAL, not skipped:
+        # silently staging an empty header directory produces a vault that looks like a
+        # recovery path and is not, which is precisely the failure mode this module's
+        # staleness alarm exists to catch.
+        echo "nixvault-assemble: importing pre-generated LUKS header backups..."
+        install -d -m 0700 "$staging/luksHeaderBackups"
+        install -d -m 0700 "$staging/deviceRoleMap"
+        ${lib.concatMapStringsSep "\n" (src: ''
+          if [ ! -d "${src}" ]; then
+            echo "nixvault-assemble: header import source '${src}' does not exist or is not a directory" >&2
+            exit 1
+          fi
+          echo "  <- ${src}"
+          cp -a --no-preserve=ownership "${src}"/. "$staging/luksHeaderBackups/"
+        '') cfg.importHeaderBackups}
+        # A role map may travel alongside the headers; move it to its own category if so.
+        if [ -e "$staging/luksHeaderBackups/device-role-map.txt" ]; then
+          mv "$staging/luksHeaderBackups/device-role-map.txt" "$staging/deviceRoleMap/"
+        fi
+        n=$(find "$staging/luksHeaderBackups" -type f -name '*.img' | wc -l)
+        [ "$n" -gt 0 ] || { echo "nixvault-assemble: imported 0 header files -- refusing to stage an empty recovery core" >&2; exit 1; }
+        echo "nixvault-assemble: imported $n header backup(s)"
       ''}
 
       ${lib.concatMapStringsSep "\n" (cat: ''
@@ -708,6 +734,37 @@ in
       '';
     };
 
+    importHeaderBackups = lib.mkOption {
+      type = lib.types.listOf lib.types.path;
+      default = [ ];
+      example = [ "/var/lib/fleet-luks-headers" ];
+      description = ''
+        Directories of ALREADY-GENERATED LUKS header backups to stage into this vault,
+        instead of producing them locally from `luksVolumes`.
+
+        WHY THIS EXISTS. `luksHeaderBackups` is a GENERATED category: it is produced at
+        assemble time by running `cryptsetup luksHeaderBackup` against `luksVolumes`,
+        which only works on the host that physically has those disks. That makes a
+        SECOND vault on a DIFFERENT machine -- the whole point of failure-domain
+        diversity, since a disaster taking the primary host also takes the medium
+        plugged into it -- structurally unable to carry the fleet's headers. It would
+        hold keys and a runbook and nothing that actually recovers a volume.
+
+        A host that sets this stages the supplied directories verbatim into the
+        `luksHeaderBackups` category. The headers then live INSIDE that host's own
+        container, so they remain available after the machine that generated them is
+        gone -- which is the entire reason to put them somewhere else.
+
+        The path only has to be readable AT ASSEMBLE TIME, while both machines are
+        alive. It may perfectly well be an NFS mount from the very host being protected;
+        once committed, the copy inside this vault is independent of it.
+
+        Mutually exclusive with a non-empty `luksVolumes` -- see the assertion. One host
+        generates, another imports; a host doing both would produce two sets of headers
+        in one directory with no way to tell which is authoritative.
+      '';
+    };
+
     sources = lib.genAttrs staticCategories mkSourceOption;
 
     schedule.onCalendar = lib.mkOption {
@@ -788,6 +845,21 @@ in
     nixvault.budgetMiB = activeTier.budgetMiB;
 
     assertions = [
+      {
+        assertion = !(cfg.luksVolumes != [ ] && cfg.importHeaderBackups != [ ]);
+        message = ''
+          nixvault.luksVolumes and nixvault.importHeaderBackups are both non-empty. Pick one.
+
+          They are two answers to the same question -- "where do this vault's LUKS header
+          backups come from" -- and doing both writes two sets into one directory with no
+          way to tell which is authoritative. A header that looks like a recovery path and
+          is not is the exact failure this module's staleness alarm exists to catch.
+
+          GENERATE (luksVolumes) on the host that physically has the disks. IMPORT
+          (importHeaderBackups) on a second host whose whole purpose is to hold a copy
+          somewhere the first host's disaster does not reach.
+        '';
+      }
       {
         assertion = cfg.tier != null;
         message = ''
