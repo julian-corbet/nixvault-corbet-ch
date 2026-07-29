@@ -466,7 +466,13 @@ let
 
       umount "$mnt"
       rmdir "$mnt"
-      cryptsetup close "$mapper"
+      # Same rule as the trap: close ONLY what this tool opened. On a host where the
+      # initrd chain-opened the container off the operator's single boot passphrase,
+      # closing it here would tear the vault down after the first commit and every
+      # later one would find it gone -- turning an unattended lifecycle into a silent
+      # one-shot. (The trap was guarded first and this line was missed; the symptom was
+      # exactly that: adoption logged correctly, mapper absent afterwards.)
+      [ "$opened_here" = 1 ] && cryptsetup close "$mapper" || true
       trap - EXIT
 
       date -u +%s > "${cfg.stateDirectory}/last-written-timestamp"
