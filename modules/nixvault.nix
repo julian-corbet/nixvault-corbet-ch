@@ -227,6 +227,60 @@ let
     fi
   '';
 
+  # ── nixstorage: read defensively, never imported -- see modules/disks.nix's own header on
+  # that sibling repo for the incident this closes. Three repos (this module's own `device` and
+  # `luksVolumes[].device` among them) each typed a `/dev/disk/by-id` string for what is, on a
+  # real host, the same handful of physical disks, with nothing asserting any two of them agreed.
+  # nixstorage's layout module is the one that WRITES PARTITION TABLES, so a drifted string here
+  # means a layout run and a nixvault-create/-update run could disagree about which disk is
+  # which. Separately, and just as real: on 2026-07-29 a reboot moved a rescue stick from sdr to
+  # sdq while a blank 239 GiB drive took over sdr -- a table, or a header-backup run, aimed at
+  # the remembered LETTER would have hit the wrong disk entirely. Stable `by-*` paths, resolved
+  # by NAME through nixstorage rather than retyped, are what keeps that from happening again.
+  #
+  # Two separate device facts live in this module, and they deliberately resolve from TWO
+  # DIFFERENT nixstorage tables, because they are two different KINDS of device:
+  #
+  #   nixvault.device (THIS host's own vault container) is a PARTITION -- one carved by a
+  #   `nixstorage.layout` image, never a whole disk -- so it resolves from `deviceFromLayout`
+  #   against `nixstorage.layout.images.<name>`, the same table (and the same one-way,
+  #   defensive read) nixboot's own `esp.fromLayout` already uses for the identical reason.
+  #
+  #   nixvault.luksVolumes[].device (OTHER volumes this vault merely holds header backups for)
+  #   is a WHOLE DISK -- nixvault only ever runs `cryptsetup luksHeaderBackup` against it, never
+  #   carves or formats it -- so each entry resolves from its own `fromDisk` against
+  #   `nixstorage.disks.<name>` instead, the plain disk table, not a partition layout.
+  #
+  # Both reads are entirely defensive (`config.nixstorage… or { }`), exactly as nixstorage's own
+  # reconciler.nix reads `config.nixid.posix.identities or { }`: importing nixvault WITHOUT
+  # nixstorage's layout or disks modules -- or without nixstorage at all -- evaluates fine as
+  # long as `device` and each `luksVolumes[].device` are then given directly. The two reads are
+  # independent of each other: a host may use one, both, or neither. Direction is one-way in
+  # both cases -- nixstorage gains no knowledge of nixvault, ever.
+  nsImages = config.nixstorage.layout.images or { };
+  nsDisks = config.nixstorage.disks or { };
+
+  vaultSourceImage =
+    if cfg.deviceFromLayout != null && nsImages ? "${cfg.deviceFromLayout}"
+    then nsImages."${cfg.deviceFromLayout}"
+    else null;
+
+  # A layout partition's `name` IS the GPT partition name nixstorage's own image builder passes
+  # straight to sgdisk/sfdisk (modules/layout.nix's `partitionModule.name`, typed
+  # `strMatching "^[A-Za-z0-9_.-]{1,36}$"`) -- and every character that type permits already
+  # sits inside udev's own UNESCAPED by-partlabel safe-charset (systemd's name-encoding only
+  # hex-escapes characters outside alnum plus `#+-.:=@_`). So the raw partition name maps
+  # straight onto the `/dev/disk/by-partlabel/<name>` symlink with no decode/encode step in
+  # between, and the name alone genuinely IS enough to build a stable path from here. That stops
+  # being true the day layout.nix's own name type ever widens to allow a space or a non-ASCII
+  # character -- re-derive this the moment it does, do not assume it still holds.
+  vaultSourcePart =
+    if vaultSourceImage == null then null
+    else lib.findFirst (p: p.role or null == "luks") null (vaultSourceImage.partitions or [ ]);
+
+  vaultDeviceFromLayout =
+    if vaultSourcePart == null then null else "/dev/disk/by-partlabel/${vaultSourcePart.name}";
+
   # EVAL SAFETY, same shape as nixram's own `activeLevel`: `nixvault.tier` and `nixvault.device`
   # have no default and can legitimately be null while NixOS forces most of `config` in one pass to
   # build `system.build.toplevel` -- independent of, and possibly before, whichever order
@@ -266,6 +320,12 @@ let
       staticCategories;
 
   luksVolumeNames = map (v: v.name) cfg.luksVolumes;
+
+  # Entries whose `device` resolved to nothing at all -- neither stated directly nor resolved
+  # from `fromDisk` against `nixstorage.disks`. Named here so the assertion below can say WHICH
+  # entries are broken, the same friendliness the top-level `tier`/`device` assertions already
+  # give instead of a raw "value is null but a string was expected" trace.
+  luksVolumesMissingDevice = map (v: v.name) (builtins.filter (v: v.device == null) cfg.luksVolumes);
 
   # A content fingerprint of an entire directory tree -- every file's path AND its content hash,
   # folded into one digest -- needs no LUKS access and no image built first to compute. Shared,
@@ -674,16 +734,48 @@ in
 
     device = lib.mkOption {
       type = lib.types.nullOr lib.types.str;
-      default = null;
+      default = vaultDeviceFromLayout;
+      defaultText = lib.literalExpression ''
+        the by-partlabel path of deviceFromLayout's own "luks"-role partition, else null
+      '';
       example = "/dev/disk/by-id/example-vault-partition";
       description = ''
         The block device -- or a pre-sized regular file, cryptsetup treats both identically -- this
         vault's LUKS container lives in, or will be created in by nixvault-create.
 
-        There is NO default: this is exactly as host-specific as nixboot's ESP location, and a
-        real device path here would be exactly the kind of fleet detail a public module must never
-        guess or invent. nixvault only ever asserts this is set and builds its tools against it; it
-        never partitions or sizes anything itself.
+        Defaults from `nixvault.deviceFromLayout` when that names a `nixstorage.layout` image with
+        a "luks"-role partition (see that option). Still genuinely host-specific with NO default of
+        its own beyond that, the same as nixboot's ESP location: a real device path here would be
+        exactly the kind of fleet detail a public module must never guess or invent on its own. On a
+        host that carves its vault partition some other way, or that has no `nixstorage.layout` at
+        all, state this directly -- nixvault only ever asserts it ends up set and builds its tools
+        against it; it never partitions or sizes anything itself.
+      '';
+    };
+
+    deviceFromLayout = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      example = "rescue-stick";
+      description = ''
+        Name of the `nixstorage.layout.images.<name>` describing the medium this vault's LUKS
+        container lives on. When set, `device` defaults to that image's own "luks"-role
+        partition's `/dev/disk/by-partlabel/<name>` path, instead of being restated here.
+
+        WHY THIS EXISTS. nixstorage's layout module is the one that WRITES PARTITION TABLES for
+        this vault's own medium, so a device path typed separately here -- with nothing asserting
+        it still names the same partition the layout carved -- is exactly the drift that lets a
+        `nixstorage-layout` run and a `nixvault-create`/`nixvault-update` run silently disagree
+        about which partition the vault actually is. Naming the image instead of retyping its
+        path is the same fix nixboot's own `esp.fromLayout` already applies to the identical
+        table, for the identical reason.
+
+        Which image describes THIS host's vault cannot be inferred -- a host may declare several
+        layout images for entirely unrelated media -- so it is named rather than guessed. Leave
+        null on a host that carves its vault partition some other way, or has no
+        `nixstorage.layout` at all; nixvault never imports nixstorage and reads it defensively
+        (`config.nixstorage.layout.images or { }`), so this is completely inert when nixstorage
+        is absent.
       '';
     };
 
@@ -710,18 +802,56 @@ in
     };
 
     luksVolumes = lib.mkOption {
-      type = lib.types.listOf (lib.types.submodule {
+      type = lib.types.listOf (lib.types.submodule ({ config, ... }: {
         options = {
           name = lib.mkOption {
             type = lib.types.str;
             description = "A short, filesystem-safe label for what this volume holds -- becomes the header-backup filename and its row in the device-role map. Must be unique across the whole list.";
           };
+
+          fromDisk = lib.mkOption {
+            type = lib.types.nullOr lib.types.str;
+            default = null;
+            example = "example-root-disk";
+            description = ''
+              Name of a `nixstorage.disks.<name>` entry this volume's header backup should be taken
+              from. When set, `device` defaults to that disk's own `device` path instead of being
+              restated here.
+
+              WHY THIS EXISTS -- the same drift `nixvault.deviceFromLayout` closes for the vault's
+              own container, one level down: these entries are WHOLE DISKS (nixvault only ever runs
+              `cryptsetup luksHeaderBackup` against them, never carves or formats them), so they
+              resolve from `nixstorage.disks` -- the plain disk table -- rather than from a layout
+              image. A disk named here instead of retyped cannot drift from what a layout run or any
+              other consumer calls the same physical disk.
+
+              Leave null on a host with no `nixstorage.disks` table at all, or that simply prefers
+              to state the path directly; `device` then behaves exactly as before. nixvault never
+              imports nixstorage and reads it defensively (`config.nixstorage.disks or { }`), so
+              this is completely inert when nixstorage is absent.
+            '';
+          };
+
           device = lib.mkOption {
-            type = lib.types.str;
-            description = "The block device (or by-id path) a header backup is taken from. Read-only as far as nixvault is concerned: it only ever runs `cryptsetup luksHeaderBackup` against this, never luksFormat or anything that writes to it.";
+            type = lib.types.nullOr lib.types.str;
+            default =
+              if config.fromDisk != null && nsDisks ? "${config.fromDisk}"
+              then nsDisks."${config.fromDisk}".device
+              else null;
+            defaultText = lib.literalExpression "the fromDisk entry's own device path from nixstorage.disks, else null (then required directly)";
+            description = ''
+              The block device (or by-id path) a header backup is taken from. Read-only as far as
+              nixvault is concerned: it only ever runs `cryptsetup luksHeaderBackup` against this,
+              never luksFormat or anything that writes to it.
+
+              Defaults from this entry's own `fromDisk` when that names a `nixstorage.disks` entry
+              (see that option). Genuinely required either way -- state it directly on a host with
+              no `nixstorage.disks` table, or that prefers not to name one; leaving both unset fails
+              the build with a named-entry assertion rather than a silent null device.
+            '';
           };
         };
-      });
+      }));
       default = [ ];
       example = [{ name = "example-root"; device = "/dev/disk/by-id/example-encrypted-root"; }];
       description = ''
@@ -873,12 +1003,26 @@ in
         message = ''
           nixvault.enable is true but nixvault.device is unset. This is genuinely host-specific --
           the block device or pre-sized file this vault's LUKS container lives in or will be
-          created in -- and nixvault will not guess it.
+          created in -- and nixvault will not guess it. Either state it directly, or set
+          nixvault.deviceFromLayout to a nixstorage.layout image with a "luks"-role partition.
         '';
       }
       {
         assertion = (lib.length (lib.unique luksVolumeNames)) == (lib.length luksVolumeNames);
         message = "nixvault.luksVolumes has duplicate 'name' entries -- each name becomes a header-backup filename and a device-role-map row, so it must be unique. Got: ${lib.concatStringsSep ", " luksVolumeNames}.";
+      }
+      {
+        # Friendlier than the raw "value is null but a string was expected" trace this would
+        # otherwise fail with -- the same reasoning the tier/device assertions above already
+        # apply, extended to the per-entry default that fromDisk now contributes.
+        assertion = luksVolumesMissingDevice == [ ];
+        message = ''
+          nixvault.luksVolumes has entrie(s) with no resolvable device: ${lib.concatStringsSep ", " luksVolumesMissingDevice}.
+
+          Each entry needs its device either stated directly, or resolved from that entry's own
+          fromDisk naming a nixstorage.disks.<name> entry. nixvault will not guess a whole-disk
+          path any more than it guesses its own nixvault.device.
+        '';
       }
     ];
 
