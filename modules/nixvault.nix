@@ -417,8 +417,30 @@ let
       # is not extra security, it is a second tax on the same decision, and it is what
       # blocks the whole unattended assemble->commit lifecycle on such a host.
       #
-      # WE CLOSE ONLY WHAT WE OPENED. Tearing down a mapper this tool did not create
-      # would yank the vault out from under whatever else opened it.
+      # WE CLOSE ONLY WHAT WE OPENED, and on a chain-open host that means WE NEVER
+      # CLOSE IT AT ALL -- the container is opened once by the initrd and then simply
+      # stays open for the life of the boot. That is the intended steady state, not a
+      # leak to be tidied up later:
+      #
+      #   an unattended commit that closes the container has destroyed its own next
+      #   run. There is no secret available to reopen it -- that is the entire premise
+      #   of passphrase-only -- so the first timer firing would succeed, tear the
+      #   mapper down, and every firing after it would find nothing to adopt and no
+      #   console to prompt on. The vault would stop tracking the fleet silently,
+      #   which is precisely the failure this module exists to prevent.
+      #
+      # The alternatives were considered and are all worse HERE: a keyfile or a
+      # TPM-sealed second keyslot would allow unattended reopen, but both put the
+      # unlock path back on the machine whose loss this vault is meant to survive, and
+      # a PCR-sealed slot is silently invalidated by a routine firmware update. Close-
+      # on-idle is the same problem wearing a hat -- "reopen" still needs the secret.
+      #
+      # Holding it open costs a dm-crypt mapping and leaves the plaintext reachable by
+      # root on a running box. That is not new exposure: root there already reads the
+      # age keys, the Secure Boot PKI and every LUKS header at their SOURCE paths --
+      # this vault is a copy of material that host already holds in the clear. What the
+      # container protects is the MEDIUM once it is unplugged, in a drawer, or in
+      # transit. Closing it on a live host defends nothing and breaks the lifecycle.
       opened_here=0
       if [ -e "/dev/mapper/$mapper" ]; then
         echo "nixvault-update: /dev/mapper/$mapper is already open (initrd or a prior unlock) -- adopting it, no passphrase needed."
