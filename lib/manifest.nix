@@ -71,6 +71,27 @@ let
       generated = false;
     };
 
+    overlayIdentity = {
+      summary = "the host's overlay-network identity, so a rescue system is the SAME peer";
+      detail = ''
+        A mesh/overlay client (NetBird, Tailscale) keeps a per-host private key and peer
+        registration in its state directory. Losing it does not merely disconnect the host --
+        it makes the host a DIFFERENT peer on next start, silently re-enrolling under a new
+        identity, which is how a fleet ends up with a graveyard of dead peers and a routing
+        peer that no longer routes.
+
+        It is carried here for a second, sharper reason: a rescue system needs to be
+        REACHABLE, and reachable as the machine you already know, not as a stranger. That
+        state normally lives on the host's own root filesystem -- which is exactly the thing
+        that is gone when the rescue boots. A vault on removable media is reachable with
+        every pool dead, so it is the only place this can live and still be there when it
+        is needed.
+
+        Small (tens of KiB) and high-value. Both tiers pack it.
+      '';
+      generated = false;
+    };
+
     secureBootPki = {
       summary = "the Secure Boot signing keys (PK/KEK/db) needed to re-sign a boot chain after a board swap";
       detail = ''
@@ -129,6 +150,7 @@ let
     "deviceRoleMap"
     "sopsAgeKeys"
     "recoveryKeys"
+    "overlayIdentity"
     "secureBootPki"
     "runbook"
   ];
