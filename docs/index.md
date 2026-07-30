@@ -84,9 +84,12 @@ read-write f2fs filesystem instead: formatted once, at `nixvault-create`
 time, then synced into incrementally by `rsync` on every `nixvault-update`
 after that, so a commit only ever writes the files that actually changed.
 
-f2fs's own compression mount recipe is vendored, not invented, from a sibling
-project's field-proven store recipe (`lib/f2fs-vault-opts.nix`). f2fs is the
-right choice here even though that sibling's own rescue image deliberately
+f2fs's own compression mount recipe is consumed directly from
+[nixfs](https://github.com/julian-corbet/nixfs-corbet-ch)
+(`lib.catalogue.filesystems.f2fs.compression`), the one canonical copy of the
+same field-proven recipe a sibling project's own store uses — never a second,
+independently-vendored copy. f2fs is the right choice here even though that
+sibling's own rescue image deliberately
 rejected it for its own store: f2fs's fs-mode compression reserves
 *uncompressed* blocks until an explicit release pass runs, which is a real
 problem when ingesting a whole closure in one shot into a tight partition —

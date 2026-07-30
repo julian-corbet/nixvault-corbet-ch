@@ -62,7 +62,8 @@ touched after its first commit. The vault's LUKS container backing file's
 allocated-block count (`stat -c%b`, the kernel's own real-usage accounting)
 is measured immediately either side of two commits: the first, of the whole
 manifest including the bulk file; the second, changing only a few bytes of
-the runbook. `nodiscard` (carried in `lib/f2fs-vault-opts.nix`) keeps freed
+the runbook. `nodiscard` (part of the shared recipe in nixfs's
+`lib/catalogue.nix`, `filesystems.f2fs.compression`) keeps freed
 blocks from being punched back to sparse holes, which is what makes an
 allocated-block delta a faithful proxy for real bytes written to the block
 layer for that specific commit.

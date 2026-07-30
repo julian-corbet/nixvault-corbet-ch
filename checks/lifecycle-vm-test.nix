@@ -47,8 +47,9 @@
 #      -- a plain regular file, never a real or emulated block device -- by its ALLOCATED BLOCK
 #      COUNT (`stat -c%b`, the kernel's own real-usage accounting for that file) immediately
 #      before and after each commit, and asserts the second commit's delta is a small fraction of
-#      the first's. `nodiscard` (carried in `lib/f2fs-vault-opts.nix`) is exactly what makes this
-#      legible: without it, freed blocks could be punched back to sparse holes and blur the
+#      the first's. `nodiscard` (in the shared recipe -- nixfs's lib/catalogue.nix,
+#      filesystems.f2fs.compression) is exactly what makes this legible: without it, freed
+#      blocks could be punched back to sparse holes and blur the
 #      measurement; with it, an allocated-block delta is a faithful proxy for real bytes written
 #      to the block layer for that commit, same as reading a real block device's own write
 #      counters would be.
@@ -261,8 +262,9 @@ pkgs.testers.nixosTest {
         # point 8 for the full reasoning. The vault's LUKS container is a plain regular file
         # (never a real or emulated block device, per this test's own house rule); `stat -c%b`
         # reports that file's REAL allocated block count, which only grows when bytes are
-        # actually written to previously-sparse regions -- `nodiscard` (lib/f2fs-vault-opts.nix)
-        # ensures freed blocks are never punched back to holes and blurring this signal. Commit 1
+        # actually written to previously-sparse regions -- `nodiscard` (the shared recipe, nixfs's
+        # lib/catalogue.nix filesystems.f2fs.compression) ensures freed blocks are never punched
+        # back to holes and blurring this signal. Commit 1
         # had to write the whole manifest (including the 8 MiB incompressible bulk file) into a
         # freshly-formatted, entirely-sparse filesystem; commit 2 changed only a few bytes of the
         # runbook and left that bulk file untouched, so its real write footprint should be a small

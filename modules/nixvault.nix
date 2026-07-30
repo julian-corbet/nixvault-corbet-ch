@@ -1,7 +1,7 @@
 #
 # modules/nixvault.nix -- a small, passphrase-only recovery vault, built on the host it protects.
 #
-# THE GAP THIS CLOSES. Every other piece of encrypted storage on a fleet has an unlock path that
+# THE GAP THIS CLOSES. Every other piece of encrypted storage has an unlock path that
 # depends on the machine it lives on: a TPM that seals to firmware measurements, a keyfile that
 # sits on the same disk, an initrd that only exists on that one box. All of that is exactly backwards
 # for the one artifact whose entire job is surviving the day a machine's own unlock path is gone --
@@ -29,20 +29,26 @@
 # format it rides alongside) and synced into incrementally by every `nixvault-update` after that --
 # see THE LIFECYCLE below for what "synced into incrementally" actually means.
 #
-# f2fs's mount recipe (`lib/f2fs-vault-opts.nix`) is VENDORED, not invented, from the sibling
-# nixnas project's own field-proven store recipe (its `modules/lib/f2fs-store-mount-opts.nix` +
-# `modules/boot/disk.nix`'s mkfs invocation, `docs/STORAGE.md` §§4-6) -- and f2fs is the RIGHT
-# choice here even though that sibling's own rescue SLOT deliberately rejected it. The reason it
-# was wrong there is that f2fs's fs-mode compression reserves UNCOMPRESSED blocks until an
-# explicit `release_cblocks` pass runs, which bites hard when ingesting a whole closure in one
-# shot into a partition with almost no headroom to spare. This vault is the opposite shape of
-# write entirely: a small payload (the tier budgets are 500 MiB / 4096 MiB) landing on a device
-# sized with roughly TEN TIMES that headroom, written incrementally -- one changed file at a time
-# -- with a release pass run after every commit, not deferred to some later maintenance window.
-# The accounting gate f2fs's reservation-until-release behavior creates never gets anywhere near
-# full on this container. Do not "fix" this by arguing back to squashfs; the slow-flash problem
-# squashfs actually had (whole-volume rewrites) is the one f2fs solves, and the tight-partition
-# problem f2fs actually had (in the rescue SLOT) simply does not exist here.
+# f2fs's mount recipe is consumed from nixfs (`nixfsCatalogue.filesystems.f2fs.compression` --
+# see nixfs's lib/catalogue.nix for the per-flag rationale), the SAME field-proven recipe
+# nixnas's own USB store uses (its `modules/boot/disk.nix` mkfs invocation, `docs/STORAGE.md`
+# §§4-6) -- and f2fs is the RIGHT choice here even though nixnas's own rescue SLOT deliberately
+# rejected it. The reason it was wrong there is that f2fs's fs-mode compression reserves
+# UNCOMPRESSED blocks until an explicit `release_cblocks` pass runs, which bites hard when
+# ingesting a whole closure in one shot into a partition with almost no headroom to spare. This
+# vault is the opposite shape of write entirely: a small payload (the tier budgets are 500 MiB /
+# 4096 MiB) landing on a device sized with roughly TEN TIMES that headroom, written incrementally
+# -- one changed file at a time -- with a release pass run after every commit, not deferred to
+# some later maintenance window. The accounting gate f2fs's reservation-until-release behavior
+# creates never gets anywhere near full on this container. Do not "fix" this by arguing back to
+# squashfs; the slow-flash problem squashfs actually had (whole-volume rewrites) is the one f2fs
+# solves, and the tight-partition problem f2fs actually had (in the rescue SLOT) simply does not
+# exist here. THIS RECIPE IS ONE, SHARED FACT, NOT A SECOND COPY: it used to be vendored here
+# (`lib/f2fs-vault-opts.nix`, a byte-for-byte copy of nixnas's own list) specifically so it
+# "cannot quietly drift" -- true, but the fix for a copy drifting is not a second copy, it is no
+# copy; nixfs is the one place this now lives, and if this vault's own write pattern ever needed
+# a genuinely different flag, that would be a parameter passed at THIS call site, never a second
+# variant sitting inside nixfs's own data.
 #
 # COMPRESSION HERE IS A WRITE-SPEED WIN, NOT A CAPACITY ONE -- say so here so nobody later
 # "optimises" it away by pointing at the tier budgets and asking why a vault this small needs
@@ -52,9 +58,13 @@
 # options in the name of "simplifying" this module -- that would trade a free win for none.
 #
 # THE KERNEL FLOOR THIS RELIES ON: f2fs's release/reserve `i_blocks` accounting only becomes
-# correct on kernel >= 6.12 (see `docs/STORAGE.md` §5's own citation trail on the sibling project).
-# That project gets this floor for free from an unrelated dependency -- its ZFS pools force a
-# recent-enough kernel regardless of f2fs. nixvault has no such freebie: it is not tied to any
+# correct on kernel >= 6.12 -- `requiredKernel`, read from the SAME nixfs recipe as the mkfs/mount
+# facts above (`nixfsCatalogue.filesystems.f2fs.compression.requiredKernel`; see nixfs's own
+# lib/catalogue.nix for the citation trail: release-cblocks decoupled from the VFS immutable bit
+# since 5.14, a compressed-block SPOR fix ~6.7, this accounting fix ~6.12). nixnas's sibling
+# project gets this floor for free from an unrelated dependency -- its ZFS pools force a
+# recent-enough kernel regardless of f2fs, and it now asserts as much at eval time
+# (`modules/boot/kernel.nix`). nixvault has no such freebie: it is not tied to any
 # other subsystem's kernel cap, so it checks the running kernel explicitly, by name, at the one
 # moment it matters (immediately before `nixvault-create` formats the filesystem, and immediately
 # before `nixvault-update` mounts it) rather than assuming whatever kernel happens to be running
@@ -135,7 +145,7 @@
 #   proxy for "the container already holds this". A mismatch means the manifest has moved on since
 #   the last commit -- content drift, not merely age -- and `nixvault-verify` says so in as many
 #   words: run nixvault-update. `staleness.alertCommand` is a deliberate escape hatch rather than a
-#   hardcoded channel: a public module cannot know which fleet's paging system to call.
+#   hardcoded channel: a public module cannot know which operator's paging system to call.
 #
 # THE PACKING PIPELINE (nixvault-assemble): rm -rf the staging directory, re-populate it (generated
 # categories from `cryptsetup luksHeaderBackup` against `nixvault.luksVolumes`; static categories
@@ -148,7 +158,7 @@
 # never itself be copied anywhere -- only the LUKS container is meant to travel.
 #
 # OFFSITE COPIES ARE THE ONE PLACE THE PASSPHRASE-ONLY TRADE DOES NOT SURVIVE CONTACT. Because
-# `nixvault.luksVolumes` and the sops keys put the fleet's OWN recovery material inside the vault,
+# `nixvault.luksVolumes` and the sops keys put the operator's OWN recovery material inside the vault,
 # a copy that leaves this machine still carrying the reused passphrase keyslot hands whoever has it
 # an offline-attackable copy of that recovery material -- offline meaning at leisure, forever, no
 # lockout, no rate limit. `nixvault-export-offsite` exists for exactly this: it re-wraps a COPY with
@@ -199,25 +209,29 @@
 # zswap/oomd surface (which genuinely does need a NixOS-only escape hatch on one backend -- see
 # that project's own system-manager/ split for the case where "one file" is NOT the honest answer).
 #
-{ config, lib, pkgs, ... }:
+{ config, lib, pkgs, nixfsCatalogue, ... }:
 
 let
   cfg = config.nixvault;
   manifest = import ../lib/manifest.nix { };
   inherit (manifest) tiers tierNames categoryNames staticCategories generatedCategories;
 
-  # The f2fs recipe, vendored unchanged from the sibling nixnas project -- see
-  # lib/f2fs-vault-opts.nix's own header for exactly what each flag does and why.
-  f2fsOpts = import ../lib/f2fs-vault-opts.nix;
+  # THE f2fs compression recipe -- ONE, canonical copy, owned by nixfs (the filesystem domain)
+  # and consumed here as plain data, never vendored. See nixfs's lib/catalogue.nix
+  # (filesystems.f2fs.compression) for the per-flag rationale; `nixfsCatalogue` reaches this
+  # module as a plain argument via flake.nix's `_module.args`, not a config read, because a
+  # recipe is a constant, not a per-host fact.
+  f2fsOpts = nixfsCatalogue.filesystems.f2fs.compression;
   f2fsMountOptionsStr = lib.concatStringsSep "," f2fsOpts.mountOptions;
 
-  # THE KERNEL FLOOR release_cblocks needs -- see this module's own "THE KERNEL FLOOR" header
-  # section for why this is a runtime check, not a Nix `assertions` entry: this module owns no
-  # `boot.*` surface on either backend it exports to, and system-manager in particular has no
-  # `boot.kernelPackages` to force at eval time. `uname -r` is exactly as meaningful on a foreign
-  # system-manager host as on NixOS -- it names the kernel the script is ACTUALLY about to run
-  # f2fs operations under, which is the only thing that matters here.
-  requiredKernel = "6.12";
+  # THE KERNEL FLOOR release_cblocks needs -- read from the SAME nixfs recipe as the mkfs/mount
+  # facts above. See this module's own "THE KERNEL FLOOR" header section for why this is a
+  # runtime check, not a Nix `assertions` entry: this module owns no `boot.*` surface on either
+  # backend it exports to, and system-manager in particular has no `boot.kernelPackages` to
+  # force at eval time. `uname -r` is exactly as meaningful on a foreign system-manager host as
+  # on NixOS -- it names the kernel the script is ACTUALLY about to run f2fs operations under,
+  # which is the only thing that matters here.
+  requiredKernel = f2fsOpts.requiredKernel;
   kernelFloorGuard = ''
     running_kernel="$(uname -r)"
     oldest="$(printf '%s\n%s\n' "${requiredKernel}" "$running_kernel" | sort -V | head -n1)"
@@ -512,7 +526,7 @@ let
       #   run. There is no secret available to reopen it -- that is the entire premise
       #   of passphrase-only -- so the first timer firing would succeed, tear the
       #   mapper down, and every firing after it would find nothing to adopt and no
-      #   console to prompt on. The vault would stop tracking the fleet silently,
+      #   console to prompt on. The vault would drift out of sync silently,
       #   which is precisely the failure this module exists to prevent.
       #
       # The alternatives were considered and are all worse HERE: a keyfile or a
@@ -551,14 +565,15 @@ let
       # own header). Plain rsync (never --inplace: a changed file is written to a NEW temp file
       # and renamed over the old one, so an already-released compressed file is never rewritten
       # IN PLACE -- the one write pattern f2fs's release_cblocks leaves EIO/EPERM-blocked, see
-      # lib/f2fs-vault-opts.nix). --checksum, not mtime/size, because a GENERATED category (a
-      # fresh `cryptsetup luksHeaderBackup` run) gets a brand-new mtime on every nixvault-assemble
+      # nixfs's lib/catalogue.nix (filesystems.f2fs.compression). --checksum, not mtime/size,
+      # because a GENERATED category (a fresh `cryptsetup luksHeaderBackup` run) gets a
+      # brand-new mtime on every nixvault-assemble
       # even when its content has not actually changed -- mtime-based comparison would wrongly
       # treat that as a change and rewrite it every single commit, defeating the entire point.
       echo "nixvault-update: syncing the staged manifest in -- only files that actually changed are written..."
       rsync -a --delete --checksum "$staging"/ "$mnt"/
 
-      echo "nixvault-update: releasing this commit's reserved-but-unused compressed blocks back to the filesystem (idempotent -- already-released files are a harmless no-op; see lib/f2fs-vault-opts.nix)..."
+      echo "nixvault-update: releasing this commit's reserved-but-unused compressed blocks back to the filesystem (idempotent -- already-released files are a harmless no-op; see nixfs's lib/catalogue.nix, filesystems.f2fs.compression)..."
       sync
       find "$mnt" -xdev -type f -print0 | xargs -0 -r -n1 f2fs_io release_cblocks >/dev/null 2>&1 || true
       sync
@@ -746,7 +761,7 @@ in
         Defaults from `nixvault.deviceFromLayout` when that names a `nixstorage.layout` image with
         a "luks"-role partition (see that option). Still genuinely host-specific with NO default of
         its own beyond that, the same as nixboot's ESP location: a real device path here would be
-        exactly the kind of fleet detail a public module must never guess or invent on its own. On a
+        exactly the kind of host-specific detail a public module must never guess or invent on its own. On a
         host that carves its vault partition some other way, or that has no `nixstorage.layout` at
         all, state this directly -- nixvault only ever asserts it ends up set and builds its tools
         against it; it never partitions or sizes anything itself.
@@ -855,19 +870,19 @@ in
       default = [ ];
       example = [{ name = "example-root"; device = "/dev/disk/by-id/example-encrypted-root"; }];
       description = ''
-        Every LUKS-encrypted volume this vault should carry a header backup for -- fleet-wide, not
-        just whatever this particular host happens to own. A damaged header makes the data behind
+        Every LUKS-encrypted volume this vault should carry a header backup for -- across every
+        host, not just whatever this particular host happens to own. A damaged header makes the data behind
         it unrecoverable regardless of the passphrase, so this list is the vault's single
         highest-value payload; both tiers pack it unconditionally. No realistic example is given
         beyond the placeholder shape above, because a real device path here would be exactly the
-        fleet detail this repository must never carry.
+        host-specific detail this repository must never carry.
       '';
     };
 
     importHeaderBackups = lib.mkOption {
       type = lib.types.listOf lib.types.path;
       default = [ ];
-      example = [ "/var/lib/fleet-luks-headers" ];
+      example = [ "/var/lib/luks-headers" ];
       description = ''
         Directories of ALREADY-GENERATED LUKS header backups to stage into this vault,
         instead of producing them locally from `luksVolumes`.
@@ -877,7 +892,7 @@ in
         which only works on the host that physically has those disks. That makes a
         SECOND vault on a DIFFERENT machine -- the whole point of failure-domain
         diversity, since a disaster taking the primary host also takes the medium
-        plugged into it -- structurally unable to carry the fleet's headers. It would
+        plugged into it -- structurally unable to carry the other hosts' headers. It would
         hold keys and a runbook and nothing that actually recovers a volume.
 
         A host that sets this stages the supplied directories verbatim into the
@@ -945,7 +960,7 @@ in
         whenever a staleness check OR a content-drift check fails -- see nixvault-verify's own
         compare step (staged content vs. what nixvault-update last actually committed). Left unset
         by default and only ever logged to the journal, because a public module cannot know which
-        fleet's paging or notification channel to call -- point this at whatever the consuming host
+        operator's paging or notification channel to call -- point this at whatever the consuming host
         already uses.
       '';
     };

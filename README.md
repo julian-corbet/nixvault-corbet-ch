@@ -70,9 +70,12 @@ a compressed, read-write f2fs filesystem instead: formatted once at
 `nixvault-update` after that, so a commit only ever writes the files that
 actually changed.
 
-f2fs's compression mount recipe is vendored, not invented, from the sibling
+f2fs's compression mount recipe is consumed directly from
+[nixfs](https://github.com/julian-corbet/nixfs-corbet-ch)
+(`lib.catalogue.filesystems.f2fs.compression`) — the one canonical copy of
+the same field-proven recipe the sibling
 [nixnas](https://github.com/julian-corbet/nixnas-corbet-ch) project's own
-field-proven store recipe — see `lib/f2fs-vault-opts.nix`. f2fs is the right
+store uses, never a second, independently-vendored copy. f2fs is the right
 choice here even though nixnas's own rescue SLOT deliberately rejected it:
 f2fs's fs-mode compression reserves *uncompressed* blocks until an explicit
 release pass runs, which is a real problem when ingesting a whole closure in
@@ -171,7 +174,6 @@ on purpose, because it needs the operator's passphrase.
 | `flake.nix` | Flake entry point: `nixosModules.default` / `systemManagerModules.default` (the same file, both backends), and `lib.manifest`. |
 | `modules/nixvault.nix` | The module: options, assertions, and the five lifecycle tools. |
 | `lib/manifest.nix` | Pure data: the tiers, their size budgets, and the manifest categories each one packs. |
-| `lib/f2fs-vault-opts.nix` | The f2fs mkfs/mount recipe, vendored from the sibling nixnas project — see the module header. |
 | `checks/` | Eval-time tests (including NixOS/system-manager backend parity) plus the real `pkgs.testers.nixosTest` lifecycle harness, all wired into `nix flake check`. |
 | `docs/index.md` | The design walkthrough: why passphrase-only, the create/update split, staleness, and the offsite-copy boundary. |
 | `experiments/` | Runnable trials with recorded results — see [`experiments/README.md`](experiments/README.md). |
@@ -182,16 +184,20 @@ on purpose, because it needs the operator's passphrase.
 Part of the same small, independently-usable NixOS module family:
 [nixram](https://github.com/julian-corbet/nixram-corbet-ch) (the VM-test
 pattern this project's own `checks/lifecycle-vm-test.nix` copies),
-[nixfs](https://github.com/julian-corbet/nixfs-corbet-ch) (the data/module
-split this project's `lib/manifest.nix` follows, and the "one file, both
-backends" export shape this project's own dual-backend export copies),
 [nixboot](https://github.com/julian-corbet/nixboot-corbet-ch) (the
 prose-option, one-knob-one-owner house style), and
-[nixnas](https://github.com/julian-corbet/nixnas-corbet-ch) (the field-proven
-f2fs compression recipe `lib/f2fs-vault-opts.nix` vendors — see "Why f2fs,
-not squashfs" above). nixvault has no dependency on any of them — it is built
-to sit in front of any host, independent of whatever rescue layer or boot
-stance that host uses.
+[nixnas](https://github.com/julian-corbet/nixnas-corbet-ch) (the sibling
+project whose USB store field-validated the same f2fs compression recipe
+this vault's own container uses — see "Why f2fs, not squashfs" above).
+nixvault has no dependency on nixram, nixboot, or nixnas — it is built to sit
+in front of any host, independent of whatever rescue layer or boot stance
+that host uses. The one real exception is
+[nixfs](https://github.com/julian-corbet/nixfs-corbet-ch) itself, a genuine
+flake input for exactly one thing: `lib.catalogue`, the data/module split
+this project's own `lib/manifest.nix` follows, and (since that recipe moved
+there) the one canonical copy of the f2fs mkfs/mount facts above — a
+lower-layer lib dependency, never nixfs's own NixOS module, which this
+project has no reason to install.
 
 ## License
 
