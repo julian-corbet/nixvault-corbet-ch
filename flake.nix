@@ -30,19 +30,26 @@
       forAllSystems = lib.genAttrs supportedSystems;
       pkgsFor = system: import nixpkgs { inherit system; };
 
-      # The f2fs compression recipe, made available to modules/nixvault.nix as the plain module
-      # argument `nixfsCatalogue` -- a constant this flake closes over, never a per-host
-      # `config.nixfs.*` read: a recipe is a fact about f2fs, not something a host declares.
-      # `_module.args` (rather than `specialArgs`) is what lets this stay entirely internal to
-      # the module wrapper below -- a consumer importing `nixosModules.default` never has to
-      # know nixfs exists, let alone follow it themselves.
-      withNixfsCatalogue = {
-        _module.args.nixfsCatalogue = nixfs.lib.catalogue;
-        imports = [ ./modules/nixvault.nix ];
-      };
+      # The f2fs compression recipe, applied to modules/nixvault.nix as a plain, partially-applied
+      # function argument -- a constant this flake closes over, never a per-host `config.nixfs.*`
+      # read: a recipe is a fact about f2fs, not something a host declares. NOT
+      # `_module.args.nixfsCatalogue`: a module-argument name is a GLOBAL namespace shared with
+      # anything else composed alongside this module, and nixnas (a sibling appliance-adjacent
+      # flake, also consuming nixfs's own catalogue) picked the exact same argument name for the
+      # exact same reason -- correct in each flake alone, and a hard "defined multiple times" eval
+      # failure the one time a consumer composed both (infra's mkNixnas). `_module.args` merges
+      # with `mergeOneOption`, which rejects a second definition even when the two values are
+      # identical, so no `inputs.follows` pin could have fixed that either. Partial application
+      # closes over the value before it ever becomes a module argument at all: `import
+      # ./modules/nixvault.nix { inherit nixfsCatalogue; }` fully applies the outer function here,
+      # in this flake, producing the actual `{ config, lib, pkgs, ... }:` module -- the module
+      # system never sees, and never has to call, the outer `{ nixfsCatalogue }:` layer, so nixfs
+      # never enters `_module.args` at all. A consumer importing `nixosModules.default` still
+      # never has to know nixfs exists, let alone follow it themselves.
+      nixvaultModule = import ./modules/nixvault.nix { nixfsCatalogue = nixfs.lib.catalogue; };
     in
     {
-      nixosModules.nixvault = withNixfsCatalogue;
+      nixosModules.nixvault = nixvaultModule;
       nixosModules.default = self.nixosModules.nixvault;
 
       # The system-manager (numtide) equivalent, for the one target this design requires nixvault
@@ -50,10 +57,10 @@
       # own "ONE FILE, BOTH BACKENDS" header for exactly why that is honest rather than lazy:
       # nixvault only ever touches option surface (environment.systemPackages,
       # systemd.services/timers, assertions, warnings) that system-manager supports identically
-      # to NixOS, confirmed by reading its actual module source, not assumed -- and that
-      # includes `_module.args`, the same generic `lib.evalModules` mechanism the wrapper above
-      # uses, not a NixOS-only extension.
-      systemManagerModules.nixvault = withNixfsCatalogue;
+      # to NixOS, confirmed by reading its actual module source, not assumed. The partial
+      # application above is backend-agnostic too -- it happens before either backend's module
+      # system ever runs, so both get the identical already-applied module.
+      systemManagerModules.nixvault = nixvaultModule;
       systemManagerModules.default = self.systemManagerModules.nixvault;
 
       # The manifest, exposed so a consumer can inspect the tier/category shape without re-reading

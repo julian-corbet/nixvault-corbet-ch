@@ -217,7 +217,21 @@
 # zswap/oomd surface (which genuinely does need a NixOS-only escape hatch on one backend -- see
 # that project's own system-manager/ split for the case where "one file" is NOT the honest answer).
 #
-{ config, lib, pkgs, nixfsCatalogue, ... }:
+# `nixfsCatalogue` is a plain closure argument, partially applied by flake.nix at import time
+# (`import ./modules/nixvault.nix { nixfsCatalogue = nixfs.lib.catalogue; }`) — never
+# `_module.args`. A module-argument name is a GLOBAL namespace shared with anything else composed
+# alongside this module, and nixnas (a sibling appliance-adjacent flake, also consuming nixfs's
+# own catalogue) picked the exact same argument name for the exact same reason — correct in each
+# flake alone, and a hard "defined multiple times" eval failure the one time a consumer composed
+# both (infra's mkNixnas). `_module.args` merges with `mergeOneOption`, which rejects a second
+# definition even when the two values are identical, so no `inputs.follows` pin could have fixed
+# that either. Partial application closes over the value before it ever becomes a module argument
+# at all, ruling the collision out by construction: this file is a function of `nixfsCatalogue`
+# first, and ONLY THEN a NixOS/system-manager module of `{ config, lib, pkgs, ... }` — the module
+# system never calls the outer function, so it never has a chance to inject the standard module
+# args into it either.
+{ nixfsCatalogue }:
+{ config, lib, pkgs, ... }:
 
 let
   cfg = config.nixvault;
@@ -227,8 +241,8 @@ let
   # THE f2fs compression recipe -- ONE, canonical copy, owned by nixfs (the filesystem domain)
   # and consumed here as plain data, never vendored. See nixfs's lib/catalogue.nix
   # (filesystems.f2fs.compression) for the per-flag rationale; `nixfsCatalogue` reaches this
-  # module as a plain argument via flake.nix's `_module.args`, not a config read, because a
-  # recipe is a constant, not a per-host fact.
+  # module as a plain, partially-applied argument (see the header above), not a config read,
+  # because a recipe is a constant, not a per-host fact.
   f2fsOpts = nixfsCatalogue.filesystems.f2fs.compression;
   f2fsMountOptionsStr = lib.concatStringsSep "," f2fsOpts.mountOptions;
 
