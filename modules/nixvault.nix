@@ -957,7 +957,7 @@ in
         options = {
           name = lib.mkOption {
             type = lib.types.str;
-            example = "corbet-server";
+            example = "primary";
             description = ''
               A short, unique identifier for this pull -- becomes its systemd service and timer
               name (`nixvault-header-pull-<name>`). Distinct entries need distinct names even
