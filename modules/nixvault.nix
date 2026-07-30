@@ -171,7 +171,15 @@
 #   OWNED : the tier (`nixvault.tier`, no default -- a per-host capacity fact, the same shape as
 #           nixram's level), the manifest selection and its packing (`nixvault-assemble`), the
 #           create/update/verify/export lifecycle tools, and the timers that keep the staged image
-#           fresh.
+#           fresh. ALSO OWNED: the TRANSPORT that gets a remote host's already-published LUKS
+#           header backups onto local disk for a second vault to import
+#           (`nixvault.headerBackupPull` -- a signed rsync/ssh pull, never NFS or any other
+#           unauthenticated channel). Generating those backups in the first place is NOT this
+#           module's job (see the next NOT below); this module owns only fetching what some other
+#           host already produced.
+#   NOT   : producing a LUKS header backup at all -- that is the publishing host's own domain
+#           (e.g. nixluks's `headerBackup.destination`/`.schedule`). `nixvault.luksVolumes` is the
+#           one exception, and only on the host that physically owns those disks.
 #   NOT   : partitioning, formatting, or sizing the target device -- `nixvault.device` is a fact
 #           this module asserts and builds against, never something it creates. Provisioning that
 #           device is a disk-layout tool's job, same boundary nixboot draws around the ESP.
@@ -340,6 +348,26 @@ let
   # entries are broken, the same friendliness the top-level `tier`/`device` assertions already
   # give instead of a raw "value is null but a string was expected" trace.
   luksVolumesMissingDevice = map (v: v.name) (builtins.filter (v: v.device == null) cfg.luksVolumes);
+
+  headerPullNames = map (p: p.name) cfg.headerBackupPull;
+
+  # The TRANSPORT half of importHeaderBackups: a real rsync/ssh invocation, parameterised per
+  # entry (remote host, key, paths). Unlike the manifest-staging scripts below there is no single
+  # shared script here -- one pkgs.writeShellApplication PER declared pull, named for its own
+  # entry so an operator can run it by hand (`nixvault-header-pull-<name>`) exactly like every
+  # other nixvault tool. See headerBackupPull's own option description for the full "why rsync
+  # over ssh, never NFS" reasoning.
+  mkHeaderPullScript = p: pkgs.writeShellApplication {
+    name = "nixvault-header-pull-${p.name}";
+    runtimeInputs = [ pkgs.rsync pkgs.openssh pkgs.coreutils ];
+    text = ''
+      set -euo pipefail
+      install -d -m 0700 "${p.localPath}"
+      rsync -a --delete \
+        -e "ssh -i ${p.sshKeyFile} -o BatchMode=yes -o StrictHostKeyChecking=accept-new" \
+        "${p.remoteUser}@${p.remoteHost}:${p.remotePath}" "${p.localPath}/"
+    '';
+  };
 
   # A content fingerprint of an entire directory tree -- every file's path AND its content hash,
   # folded into one digest -- needs no LUKS access and no image built first to compute. Shared,
@@ -910,6 +938,101 @@ in
       '';
     };
 
+    headerBackupPull = lib.mkOption {
+      type = lib.types.listOf (lib.types.submodule {
+        options = {
+          name = lib.mkOption {
+            type = lib.types.str;
+            example = "corbet-server";
+            description = ''
+              A short, unique identifier for this pull -- becomes its systemd service and timer
+              name (`nixvault-header-pull-<name>`). Distinct entries need distinct names even
+              when this list holds only one.
+            '';
+          };
+
+          remoteHost = lib.mkOption {
+            type = lib.types.str;
+            description = "The publishing host -- an address or name ssh(1) can resolve on its own; never resolved or validated by this module.";
+          };
+
+          remoteUser = lib.mkOption {
+            type = lib.types.str;
+            default = "root";
+            description = "Remote user the pull connects as -- the identity the remote's forced-command key is bound to server-side, not a privilege choice made here.";
+          };
+
+          remotePath = lib.mkOption {
+            type = lib.types.str;
+            description = ''
+              Directory on the remote host to pull from, verbatim -- the same directory that
+              host's own `nixluks.headerBackup.destination` resolves its per-volume files under.
+              A trailing slash matters to rsync exactly as it always does: with one, this
+              directory's CONTENTS land in `localPath`; without one, a copy of the directory
+              itself is nested inside it. State it exactly as the remote publishes it.
+            '';
+          };
+
+          sshKeyFile = lib.mkOption {
+            type = lib.types.path;
+            description = ''
+              Private key for this pull. Already present on disk -- generated and deployed out
+              of band, never by this module (a header-pull key is exactly the kind of secret
+              nixvault itself never touches or manages). Confined server-side to a forced
+              `rsync --server --sender` over exactly `remotePath`, with `restrict` (no shell, no
+              forwarding, no pty) -- a key that can only read the one directory it exists to
+              read.
+            '';
+          };
+
+          localPath = lib.mkOption {
+            type = lib.types.path;
+            description = ''
+              Where the pulled files land locally. List this SAME path in
+              `nixvault.importHeaderBackups` to actually stage them into the vault -- this option
+              only gets the bytes onto local disk, it does not make `nixvault-assemble` read
+              them. The two are kept separate rather than auto-linked: a silently-injected import
+              path is exactly the kind of inference this module's option surface never does.
+            '';
+          };
+
+          schedule = lib.mkOption {
+            type = lib.types.str;
+            default = "daily";
+            description = "systemd OnCalendar= cadence for this pull. Independent of nixvault.schedule.onCalendar -- ordered ahead of nixvault-assemble by Before=, not by sharing a timer.";
+          };
+        };
+      });
+      default = [ ];
+      example = [{
+        name = "example-publisher";
+        remoteHost = "example-publisher.lan";
+        remotePath = "/var/lib/example/luks-headers/";
+        sshKeyFile = "/root/.ssh/id_ed25519_headerpull";
+        localPath = "/var/lib/nixvault-pulled-headers";
+      }];
+      description = ''
+        ONE-WAY, signed pulls of already-published LUKS header backups from a remote host that
+        owns disks this vault cannot reach -- the TRANSPORT half of `importHeaderBackups` (see
+        that option): getting bytes onto local disk is this option's job, staging them into the
+        vault is `importHeaderBackups`' own. Generation stays the publishing host's job (that
+        host's own `nixluks.headerBackup.destination`/`.schedule`); this module has no opinion on
+        how that side is built, only on how to fetch what it already produced.
+
+        Uses rsync over ssh, deliberately never NFS or any other unauthenticated transport -- a
+        LUKS header is the KDF-wrapped master key plus every keyslot, offline-attackable with no
+        rate limit by anyone who can read it, so the pull is both authenticated (a dedicated,
+        forced-command key) and encrypted in transit, landing in a directory this module creates
+        0700 before the first pull.
+
+        Ordered BEFORE nixvault-assemble whenever that timer is enabled
+        (`nixvault.assemble.enable`), so a failed pull surfaces as a failed assemble --
+        `nixvault-assemble` already refuses to stage zero header files from an empty
+        `importHeaderBackups` directory rather than produce a vault that looks like a recovery
+        path and is not, and this is the identical refusal one step upstream.
+      '';
+    };
+
     sources = lib.genAttrs staticCategories mkSourceOption;
 
     schedule.onCalendar = lib.mkOption {
@@ -985,134 +1108,183 @@ in
     };
   };
 
-  config = lib.mkIf cfg.enable {
-    nixvault.manifestCategories = activeTier.categories;
-    nixvault.budgetMiB = activeTier.budgetMiB;
+  # mkMerge, not one plain attrset: the header-pull fragment below assigns `systemd.services` and
+  # `systemd.timers` wholesale (built from a runtime list via lib.listToAttrs), which the Nix
+  # parser cannot merge with the dotted `systemd.services.nixvault-assemble = ...` style bindings
+  # above at parse time -- a literal attribute path and a dynamically-computed one at the same key
+  # are not the same kind of definition, even though both are entirely valid NixOS config
+  # fragments on their own. lib.mkMerge defers the merge to eval time, where the module system
+  # already knows how to combine two attrsets that both touch `systemd.services`.
+  config = lib.mkIf cfg.enable (lib.mkMerge [
+    {
+      nixvault.manifestCategories = activeTier.categories;
+      nixvault.budgetMiB = activeTier.budgetMiB;
 
-    assertions = [
-      {
-        assertion = !(cfg.luksVolumes != [ ] && cfg.importHeaderBackups != [ ]);
-        message = ''
-          nixvault.luksVolumes and nixvault.importHeaderBackups are both non-empty. Pick one.
+      assertions = [
+        {
+          assertion = !(cfg.luksVolumes != [ ] && cfg.importHeaderBackups != [ ]);
+          message = ''
+            nixvault.luksVolumes and nixvault.importHeaderBackups are both non-empty. Pick one.
 
-          They are two answers to the same question -- "where do this vault's LUKS header
-          backups come from" -- and doing both writes two sets into one directory with no
-          way to tell which is authoritative. A header that looks like a recovery path and
-          is not is the exact failure this module's staleness alarm exists to catch.
+            They are two answers to the same question -- "where do this vault's LUKS header
+            backups come from" -- and doing both writes two sets into one directory with no
+            way to tell which is authoritative. A header that looks like a recovery path and
+            is not is the exact failure this module's staleness alarm exists to catch.
 
-          GENERATE (luksVolumes) on the host that physically has the disks. IMPORT
-          (importHeaderBackups) on a second host whose whole purpose is to hold a copy
-          somewhere the first host's disaster does not reach.
-        '';
-      }
-      {
-        assertion = cfg.tier != null;
-        message = ''
-          nixvault.enable is true but nixvault.tier is unset. There is no default and there never
-          will be an eval-time guess -- how much this host can spare for a vault is a per-host
-          capacity fact, the same shape as nixram.level. Pick one of: ${lib.concatStringsSep ", " tierNames}.
-        '';
-      }
-      {
-        assertion = cfg.device != null;
-        message = ''
-          nixvault.enable is true but nixvault.device is unset. This is genuinely host-specific --
-          the block device or pre-sized file this vault's LUKS container lives in or will be
-          created in -- and nixvault will not guess it. Either state it directly, or set
-          nixvault.deviceFromLayout to a nixstorage.layout image with a "luks"-role partition.
-        '';
-      }
-      {
-        assertion = (lib.length (lib.unique luksVolumeNames)) == (lib.length luksVolumeNames);
-        message = "nixvault.luksVolumes has duplicate 'name' entries -- each name becomes a header-backup filename and a device-role-map row, so it must be unique. Got: ${lib.concatStringsSep ", " luksVolumeNames}.";
-      }
-      {
-        # Friendlier than the raw "value is null but a string was expected" trace this would
-        # otherwise fail with -- the same reasoning the tier/device assertions above already
-        # apply, extended to the per-entry default that fromDisk now contributes.
-        assertion = luksVolumesMissingDevice == [ ];
-        message = ''
-          nixvault.luksVolumes has entrie(s) with no resolvable device: ${lib.concatStringsSep ", " luksVolumesMissingDevice}.
+            GENERATE (luksVolumes) on the host that physically has the disks. IMPORT
+            (importHeaderBackups) on a second host whose whole purpose is to hold a copy
+            somewhere the first host's disaster does not reach.
+          '';
+        }
+        {
+          assertion = cfg.tier != null;
+          message = ''
+            nixvault.enable is true but nixvault.tier is unset. There is no default and there never
+            will be an eval-time guess -- how much this host can spare for a vault is a per-host
+            capacity fact, the same shape as nixram.level. Pick one of: ${lib.concatStringsSep ", " tierNames}.
+          '';
+        }
+        {
+          assertion = cfg.device != null;
+          message = ''
+            nixvault.enable is true but nixvault.device is unset. This is genuinely host-specific --
+            the block device or pre-sized file this vault's LUKS container lives in or will be
+            created in -- and nixvault will not guess it. Either state it directly, or set
+            nixvault.deviceFromLayout to a nixstorage.layout image with a "luks"-role partition.
+          '';
+        }
+        {
+          assertion = (lib.length (lib.unique luksVolumeNames)) == (lib.length luksVolumeNames);
+          message = "nixvault.luksVolumes has duplicate 'name' entries -- each name becomes a header-backup filename and a device-role-map row, so it must be unique. Got: ${lib.concatStringsSep ", " luksVolumeNames}.";
+        }
+        {
+          assertion = (lib.length (lib.unique headerPullNames)) == (lib.length headerPullNames);
+          message = "nixvault.headerBackupPull has duplicate 'name' entries -- each name becomes a systemd unit name, so it must be unique. Got: ${lib.concatStringsSep ", " headerPullNames}.";
+        }
+        {
+          # Friendlier than the raw "value is null but a string was expected" trace this would
+          # otherwise fail with -- the same reasoning the tier/device assertions above already
+          # apply, extended to the per-entry default that fromDisk now contributes.
+          assertion = luksVolumesMissingDevice == [ ];
+          message = ''
+            nixvault.luksVolumes has entrie(s) with no resolvable device: ${lib.concatStringsSep ", " luksVolumesMissingDevice}.
 
-          Each entry needs its device either stated directly, or resolved from that entry's own
-          fromDisk naming a nixstorage.disks.<name> entry. nixvault will not guess a whole-disk
-          path any more than it guesses its own nixvault.device.
-        '';
-      }
-    ];
+            Each entry needs its device either stated directly, or resolved from that entry's own
+            fromDisk naming a nixstorage.disks.<name> entry. nixvault will not guess a whole-disk
+            path any more than it guesses its own nixvault.device.
+          '';
+        }
+      ];
 
-    warnings = sourceCategoryOutsideTierWarnings;
+      warnings = sourceCategoryOutsideTierWarnings;
 
-    environment.systemPackages = [
-      assembleScript
-      createScript
-      updateScript
-      verifyScript
-    ] ++ lib.optional cfg.exportTool.enable exportScript;
+      environment.systemPackages = [
+        assembleScript
+        createScript
+        updateScript
+        verifyScript
+      ] ++ lib.optional cfg.exportTool.enable exportScript
+      ++ map mkHeaderPullScript cfg.headerBackupPull;
 
-    # nixvault-create and nixvault-update are deliberately absent from systemd entirely, the same
-    # posture as nixboot-enroll-sb: both need a human-known passphrase (a brand-new one for create,
-    # an existing one for update), and neither should ever be reachable from a timer, a oneshot, or
-    # anything else that could run unattended.
+      # nixvault-create and nixvault-update are deliberately absent from systemd entirely, the same
+      # posture as nixboot-enroll-sb: both need a human-known passphrase (a brand-new one for create,
+      # an existing one for update), and neither should ever be reachable from a timer, a oneshot, or
+      # anything else that could run unattended.
 
-    systemd.services.nixvault-assemble = lib.mkIf cfg.assemble.enable {
-      description = "nixvault: stage the manifest into a plain directory tree (no LUKS container touched)";
-      wantedBy = [ "multi-user.target" ];
-      after = [ "local-fs.target" ];
-      serviceConfig = {
-        Type = "oneshot";
-        ExecStart = "${assembleScript}/bin/nixvault-assemble";
+      systemd.services.nixvault-assemble = lib.mkIf cfg.assemble.enable {
+        description = "nixvault: stage the manifest into a plain directory tree (no LUKS container touched)";
+        wantedBy = [ "multi-user.target" ];
+        after = [ "local-fs.target" ];
+        serviceConfig = {
+          Type = "oneshot";
+          ExecStart = "${assembleScript}/bin/nixvault-assemble";
+        };
       };
-    };
 
-    systemd.timers.nixvault-assemble = lib.mkIf cfg.assemble.enable {
-      wantedBy = [ "timers.target" ];
-      timerConfig = {
-        OnCalendar = cfg.schedule.onCalendar;
-        Persistent = true;
+      systemd.timers.nixvault-assemble = lib.mkIf cfg.assemble.enable {
+        wantedBy = [ "timers.target" ];
+        timerConfig = {
+          OnCalendar = cfg.schedule.onCalendar;
+          Persistent = true;
+        };
       };
-    };
 
-    # Unattended commit -- ONLY meaningful where the container is already open (see
-    # commit.enable). The unit deliberately does NOT provide a passphrase by any means:
-    # if the mapper is absent, nixvault-update's own `cryptsetup open` has no console,
-    # fails, and the unit fails loudly. That is the intended behaviour -- a missing
-    # unlock must surface, never be worked around with a keyfile.
-    systemd.services.nixvault-commit = lib.mkIf cfg.commit.enable {
-      description = "nixvault: commit the staged manifest into the (already-open) vault";
-      after = [ "nixvault-assemble.service" "local-fs.target" ];
-      wants = [ "nixvault-assemble.service" ];
-      serviceConfig = {
-        Type = "oneshot";
-        ExecStart = "${updateScript}/bin/nixvault-update";
-        StandardInput = "null";
+      # Unattended commit -- ONLY meaningful where the container is already open (see
+      # commit.enable). The unit deliberately does NOT provide a passphrase by any means:
+      # if the mapper is absent, nixvault-update's own `cryptsetup open` has no console,
+      # fails, and the unit fails loudly. That is the intended behaviour -- a missing
+      # unlock must surface, never be worked around with a keyfile.
+      systemd.services.nixvault-commit = lib.mkIf cfg.commit.enable {
+        description = "nixvault: commit the staged manifest into the (already-open) vault";
+        after = [ "nixvault-assemble.service" "local-fs.target" ];
+        wants = [ "nixvault-assemble.service" ];
+        serviceConfig = {
+          Type = "oneshot";
+          ExecStart = "${updateScript}/bin/nixvault-update";
+          StandardInput = "null";
+        };
       };
-    };
 
-    systemd.timers.nixvault-commit = lib.mkIf cfg.commit.enable {
-      wantedBy = [ "timers.target" ];
-      timerConfig = {
-        OnCalendar = cfg.schedule.onCalendar;
-        Persistent = true;
+      systemd.timers.nixvault-commit = lib.mkIf cfg.commit.enable {
+        wantedBy = [ "timers.target" ];
+        timerConfig = {
+          OnCalendar = cfg.schedule.onCalendar;
+          Persistent = true;
+        };
       };
-    };
 
-    systemd.services.nixvault-verify = {
-      description = "nixvault: warn if the staged manifest or the on-disk vault contents are stale, or if the manifest has drifted from what is committed";
-      wantedBy = [ "multi-user.target" ];
-      after = [ "nixvault-assemble.service" ];
-      serviceConfig = {
-        Type = "oneshot";
-        ExecStart = "${verifyScript}/bin/nixvault-verify";
+      systemd.services.nixvault-verify = {
+        description = "nixvault: warn if the staged manifest or the on-disk vault contents are stale, or if the manifest has drifted from what is committed";
+        wantedBy = [ "multi-user.target" ];
+        after = [ "nixvault-assemble.service" ];
+        serviceConfig = {
+          Type = "oneshot";
+          ExecStart = "${verifyScript}/bin/nixvault-verify";
+        };
       };
-    };
 
-    systemd.timers.nixvault-verify = {
-      wantedBy = [ "timers.target" ];
-      timerConfig = {
-        OnCalendar = cfg.schedule.onCalendar;
-        Persistent = true;
+      systemd.timers.nixvault-verify = {
+        wantedBy = [ "timers.target" ];
+        timerConfig = {
+          OnCalendar = cfg.schedule.onCalendar;
+          Persistent = true;
+        };
       };
-    };
-  };
+    }
+
+    # The header-pull transport -- one service/timer PER declared entry, ordered ahead of
+    # nixvault-assemble (when that timer runs at all) so a failed pull surfaces as a failed
+    # assemble rather than a silently-stale import directory. See headerBackupPull's own option
+    # description for the full reasoning. A separate mkMerge fragment (see the comment on
+    # `config` above) because these two keys are built wholesale from a runtime list rather than
+    # named as literal dotted paths, which the parser cannot combine with the fragment above.
+    {
+      systemd.services = lib.listToAttrs (map
+        (p: {
+          name = "nixvault-header-pull-${p.name}";
+          value = {
+            description = "nixvault: pull published LUKS header backups from ${p.remoteHost} (read-only, forced-command key)";
+            before = lib.optional cfg.assemble.enable "nixvault-assemble.service";
+            serviceConfig = {
+              Type = "oneshot";
+              ExecStart = "${mkHeaderPullScript p}/bin/nixvault-header-pull-${p.name}";
+            };
+          };
+        })
+        cfg.headerBackupPull);
+
+      systemd.timers = lib.listToAttrs (map
+        (p: {
+          name = "nixvault-header-pull-${p.name}";
+          value = {
+            wantedBy = [ "timers.target" ];
+            timerConfig = {
+              OnCalendar = p.schedule;
+              Persistent = true;
+            };
+          };
+        })
+        cfg.headerBackupPull);
+    }
+  ]);
 }

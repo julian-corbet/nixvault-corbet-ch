@@ -72,6 +72,22 @@ let
     nixvault.sources.knowledgeTree = [ "/example/knowledge-tree" ];
   });
 
+  examplePull = {
+    name = "example-publisher";
+    remoteHost = "example-publisher.lan";
+    remotePath = "/var/lib/example/luks-headers/";
+    sshKeyFile = "/root/.ssh/id_ed25519_headerpull";
+    localPath = "/var/lib/nixvault-pulled-headers";
+  };
+
+  cfg-header-pull = evalNixos (lib.recursiveUpdate validBase {
+    nixvault.headerBackupPull = [ examplePull ];
+  });
+  cfg-header-pull-no-assemble = evalNixos (lib.recursiveUpdate validBase {
+    nixvault.assemble.enable = false;
+    nixvault.headerBackupPull = [ examplePull ];
+  });
+
   toolNames = [
     "nixvault-assemble"
     "nixvault-create"
@@ -98,6 +114,9 @@ let
 
   cfg-sm-small = evalSm validBase;
   cfg-sm-medium = evalSm (lib.recursiveUpdate validBase { nixvault.tier = "medium"; });
+  cfg-sm-header-pull = evalSm (lib.recursiveUpdate validBase {
+    nixvault.headerBackupPull = [ examplePull ];
+  });
 
   backendParityChecks = [
     (check "backend-parity/small-manifest-categories-match"
@@ -124,6 +143,11 @@ let
     (check "backend-parity/assemble-and-verify-timers-render-on-system-manager-too"
       (cfg-sm-small.systemd.timers ? "nixvault-assemble" && cfg-sm-small.systemd.timers ? "nixvault-verify")
       "system-manager timers: ${builtins.toJSON (lib.attrNames cfg-sm-small.systemd.timers)}")
+
+    (check "backend-parity/header-pull-service-and-timer-render-on-system-manager-too"
+      (cfg-sm-header-pull.systemd.services ? "nixvault-header-pull-example-publisher"
+        && cfg-sm-header-pull.systemd.timers ? "nixvault-header-pull-example-publisher")
+      "system-manager systemd.services: ${builtins.toJSON (lib.attrNames cfg-sm-header-pull.systemd.services)}, systemd.timers: ${builtins.toJSON (lib.attrNames cfg-sm-header-pull.systemd.timers)}")
   ];
 
   results = [
@@ -181,6 +205,45 @@ let
         }))
       )
       "unique luksVolumes names should never fail the build")
+
+    # --- 3b. headerBackupPull -- the LUKS header TRANSPORT, and its own name uniqueness --------
+    (check "headerBackupPull/duplicate-names-fail-the-build"
+      (nixosBuildFails (lib.recursiveUpdate validBase {
+        nixvault.headerBackupPull = [ examplePull examplePull ];
+      }))
+      "expected duplicate headerBackupPull names to fail the build, but it succeeded")
+
+    (check "headerBackupPull/unique-names-build-fine"
+      (
+        !(nixosBuildFails (lib.recursiveUpdate validBase {
+          nixvault.headerBackupPull = [
+            examplePull
+            (examplePull // { name = "example-publisher-2"; })
+          ];
+        }))
+      )
+      "unique headerBackupPull names should never fail the build")
+
+    (check "headerBackupPull/renders-its-own-service-and-timer"
+      (cfg-header-pull.systemd.services ? "nixvault-header-pull-example-publisher"
+        && cfg-header-pull.systemd.timers ? "nixvault-header-pull-example-publisher")
+      "systemd.services: ${builtins.toJSON (lib.attrNames cfg-header-pull.systemd.services)}, systemd.timers: ${builtins.toJSON (lib.attrNames cfg-header-pull.systemd.timers)}")
+
+    (check "headerBackupPull/timer-uses-the-entry-s-own-schedule-not-nixvault-schedule"
+      (cfg-header-pull.systemd.timers."nixvault-header-pull-example-publisher".timerConfig.OnCalendar == "daily")
+      "got: ${cfg-header-pull.systemd.timers."nixvault-header-pull-example-publisher".timerConfig.OnCalendar or "MISSING"}")
+
+    (check "headerBackupPull/ordered-before-assemble-when-assemble-is-enabled"
+      (lib.elem "nixvault-assemble.service" cfg-header-pull.systemd.services."nixvault-header-pull-example-publisher".before)
+      "before: ${builtins.toJSON (cfg-header-pull.systemd.services."nixvault-header-pull-example-publisher".before or [ ])}")
+
+    (check "headerBackupPull/no-assemble-ordering-when-assemble-disabled"
+      (cfg-header-pull-no-assemble.systemd.services."nixvault-header-pull-example-publisher".before == [ ])
+      "expected no Before= ordering once nixvault.assemble.enable is false: ${builtins.toJSON (cfg-header-pull-no-assemble.systemd.services."nixvault-header-pull-example-publisher".before or [ ])}")
+
+    (check "headerBackupPull/installed-as-a-hand-runnable-tool-too"
+      (hasTool cfg-header-pull "nixvault-header-pull-example-publisher")
+      "nixvault-header-pull-example-publisher should be in environment.systemPackages, same as every other nixvault tool")
 
     # --- 4. every tool is installed by default, and the escape hatches actually remove one ------
     (check "packages/all-five-tools-present-by-default"
