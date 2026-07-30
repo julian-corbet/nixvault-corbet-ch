@@ -2,7 +2,7 @@
 # The manifest, in the two halves a host actually reasons about.
 #
 # `categories` is the reviewable list of WHAT a vault can carry, generically. Every entry describes
-# a class of recovery material, never a real path from any real fleet -- this repo is public, so an
+# a class of recovery material, never a real path from any real deployment -- this repo is public, so an
 # entry says "the operator's own knowledge tree", never a filesystem path that would mean something
 # to a specific machine.
 #
@@ -20,7 +20,7 @@
 # place that distinguishes the two, this file just says which names fall in which bucket.
 #
 # WHY LUKS HEADER BACKUPS AND SOPS AGE KEYS COME FIRST, EVERY TIER. A vault's primary purpose is
-# getting back into the fleet's own encrypted storage when a machine's own unlock path is gone --
+# getting back into an operator's own encrypted storage when a machine's own unlock path is gone --
 # not a convenience copy of notes. A damaged LUKS header makes the data behind it unrecoverable
 # regardless of how correct the passphrase is, and a missing sops age key makes every other secret
 # this vault carries inert ciphertext. Both tiers include both, unconditionally.
@@ -77,7 +77,7 @@ let
         A mesh/overlay client (NetBird, Tailscale) keeps a per-host private key and peer
         registration in its state directory. Losing it does not merely disconnect the host --
         it makes the host a DIFFERENT peer on next start, silently re-enrolling under a new
-        identity, which is how a fleet ends up with a graveyard of dead peers and a routing
+        identity, which is how an operator ends up with a graveyard of dead peers and a routing
         peer that no longer routes.
 
         It is carried here for a second, sharper reason: a rescue system needs to be
@@ -127,7 +127,7 @@ let
     repoSources = {
       summary = "checked-out source for the operator's own infrastructure-as-code repositories";
       detail = ''
-        The configurations that rebuild the fleet, offline-legible without needing to clone
+        The configurations that rebuild every host, offline-legible without needing to clone
         anything. Only worth the space once the header backups, keys, and runbook above are already
         covered -- hence a `medium`-tier-only category.
       '';

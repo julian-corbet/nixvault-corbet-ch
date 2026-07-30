@@ -68,7 +68,7 @@ as an unattended one — so committing is, and must stay, a deliberate human
 act, never a timer. (An earlier draft of this design claimed updates need
 "no secret at all: `luksOpen` → `dd` → `luksClose`". That is false, and
 was caught and corrected while this module was actually being built — see
-the fleet's own `nixrescue.md` §7.3 for the record of that correction.)
+this family's own `nixrescue.md` §7.3 for the record of that correction.)
 
 This is why they are two different tools instead of one idempotent one: they
 have a fundamentally different relationship to the passphrase. Create mints
@@ -130,19 +130,19 @@ not merely age — and `nixvault-verify` says exactly what to do about it: run
 `nixvault-update`.
 
 The alert channel itself (`staleness.alertCommand`) is a deliberate escape
-hatch: a public module cannot know which fleet's paging system to call, so
+hatch: a public module cannot know which host's paging system to call, so
 it only logs by default and leaves the real channel to the consuming host's
 own config.
 
 ## Offsite copies are different
 
 Because `nixvault.luksVolumes` and the sops keys put an operator's own
-fleet-wide recovery material inside the vault, a copy that leaves the
+cross-host recovery material inside the vault, a copy that leaves the
 machine while still carrying the reused passphrase keyslot hands whoever has
 it an **offline-attackable copy of that entire recovery material** — offline
 meaning at leisure, forever, with no lockout and no rate limit. The only
 thing standing in the way at that point is the entropy of a passphrase
-chosen to be memorable, which is a much weaker bar than the fleet's own
+chosen to be memorable, which is a much weaker bar than this operator's own
 encryption was ever meant to rely on.
 
 `nixvault-export-offsite` exists for exactly this boundary: it re-wraps a

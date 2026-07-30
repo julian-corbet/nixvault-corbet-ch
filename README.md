@@ -133,7 +133,7 @@ imports = [ inputs.nixvault.systemManagerModules.default ];
             device = "/dev/disk/by-id/..."; # this host's own vault partition or file
 
             # Every LUKS volume this vault should carry a header backup for --
-            # fleet-wide, not just this host's own.
+            # across all hosts, not just this host's own.
             luksVolumes = [
               { name = "myhost-root"; device = "/dev/disk/by-id/..."; }
             ];

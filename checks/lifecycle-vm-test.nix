@@ -67,7 +67,7 @@ let
   wrongPassphrase = "definitely-the-wrong-passphrase";
 
   # Writes whatever nixvault-verify hands it to a plain file -- the simplest possible stand-in for
-  # a real fleet's paging channel, and exactly why `staleness.alertCommand` is a free-text escape
+  # a real operator's paging channel, and exactly why `staleness.alertCommand` is a free-text escape
   # hatch rather than a hardcoded one (see the option's own description).
   alertScript = pkgs.writeShellScript "nixvault-test-alert" ''
     echo "ALERT: $1" >> /root/alert-log.txt
