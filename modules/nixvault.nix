@@ -230,7 +230,7 @@
 # first, and ONLY THEN a NixOS/system-manager module of `{ config, lib, pkgs, ... }` — the module
 # system never calls the outer function, so it never has a chance to inject the standard module
 # args into it either.
-{ nixfsCatalogue }:
+{ nixfsCatalogue, probeFact, collectProbes }:
 { config, lib, pkgs, ... }:
 
 let
@@ -287,14 +287,41 @@ let
   #   carves or formats it -- so each entry resolves from its own `fromDisk` against
   #   `nixstorage.disks.<name>` instead, the plain disk table, not a partition layout.
   #
-  # Both reads are entirely defensive (`config.nixstorage… or { }`), exactly as nixstorage's own
-  # reconciler.nix reads `config.nixid.posix.identities or { }`: importing nixvault WITHOUT
-  # nixstorage's layout or disks modules -- or without nixstorage at all -- evaluates fine as
-  # long as `device` and each `luksVolumes[].device` are then given directly. The two reads are
-  # independent of each other: a host may use one, both, or neither. Direction is one-way in
-  # both cases -- nixstorage gains no knowledge of nixvault, ever.
-  nsImages = config.nixstorage.layout.images or { };
-  nsDisks = config.nixstorage.disks or { };
+  # Both reads go through `lib.probeFact` (consumed from nixhost's own `lib/facts.nix` via this
+  # repo's `nixhost` flake input, closed over as this module's own outer `{ probeFact,
+  # collectProbes }:` argument -- see flake.nix's own input comment)
+  # rather than a bare `config.nixstorage… or { }`: importing nixvault WITHOUT nixstorage's layout
+  # or disks modules -- or without nixstorage at all -- still evaluates fine as long as `device`
+  # and each `luksVolumes[].device` are then given directly. What the bare form could not do is
+  # tell "nixstorage not imported here" apart from "nixstorage IS imported, but `layout.images` or
+  # `disks` itself moved or was renamed underneath this exact read" -- both used to land on the
+  # identical `{ }` fallback, silently, which is exactly the drifted-device-path incident this
+  # file's own header describes one layer up (a rescue stick moving from sdr to sdq): a rename
+  # here would be just as invisible as nixstorage never having been imported, and a nixvault-create
+  # or nixvault-update run would go on resolving `deviceFromLayout`/`fromDisk` against nothing,
+  # silently. `config.warnings` (`nixstorageFactWarnings` below) is now the only thing that would
+  # ever tell anyone -- see `checks/default.nix`'s `fact-wiring/*` group for the proof. The two
+  # reads are independent of each other: a host may use one, both, or neither. Direction is
+  # one-way in both cases -- nixstorage gains no knowledge of nixvault, ever.
+  nixstorageLayoutImagesProbe = probeFact {
+    inherit config;
+    namespace = "nixstorage";
+    path = [ "layout" "images" ];
+    fallback = { };
+  };
+  nixstorageDisksProbe = probeFact {
+    inherit config;
+    namespace = "nixstorage";
+    path = [ "disks" ];
+    fallback = { };
+  };
+  nsImages = nixstorageLayoutImagesProbe.value;
+  nsDisks = nixstorageDisksProbe.value;
+
+  nixstorageFactWarnings = (collectProbes [
+    nixstorageLayoutImagesProbe
+    nixstorageDisksProbe
+  ]).warnings;
 
   vaultSourceImage =
     if cfg.deviceFromLayout != null && nsImages ? "${cfg.deviceFromLayout}"
@@ -830,9 +857,10 @@ in
         Which image describes THIS host's vault cannot be inferred -- a host may declare several
         layout images for entirely unrelated media -- so it is named rather than guessed. Leave
         null on a host that carves its vault partition some other way, or has no
-        `nixstorage.layout` at all; nixvault never imports nixstorage and reads it defensively
-        (`config.nixstorage.layout.images or { }`), so this is completely inert when nixstorage
-        is absent.
+        `nixstorage.layout` at all; nixvault never imports nixstorage and reads it through
+        `lib.probeFact` (`lib/facts.nix`), so this is completely inert when nixstorage is absent --
+        and warns, rather than staying just as inert, if nixstorage IS imported but
+        `layout.images` itself has moved.
       '';
     };
 
@@ -884,8 +912,9 @@ in
 
               Leave null on a host with no `nixstorage.disks` table at all, or that simply prefers
               to state the path directly; `device` then behaves exactly as before. nixvault never
-              imports nixstorage and reads it defensively (`config.nixstorage.disks or { }`), so
-              this is completely inert when nixstorage is absent.
+              imports nixstorage and reads it through `lib.probeFact` (`lib/facts.nix`), so this is
+              completely inert when nixstorage is absent -- and warns, rather than staying just as
+              inert, if nixstorage IS imported but `disks` itself has moved.
             '';
           };
 
@@ -1190,7 +1219,11 @@ in
         }
       ];
 
-      warnings = sourceCategoryOutsideTierWarnings;
+      # `sourceCategoryOutsideTierWarnings` is this module's own pre-existing warning; the fact
+      # probes' own warnings (state (c) on `nixstorage.layout.images`/`nixstorage.disks` -- see
+      # `nixstorageFactWarnings`'s own comment above) are appended, not a separate `warnings`
+      # definition, so neither ever silently drops the other.
+      warnings = sourceCategoryOutsideTierWarnings ++ nixstorageFactWarnings;
 
       environment.systemPackages = [
         assembleScript

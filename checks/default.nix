@@ -21,6 +21,13 @@
 #   6. Both backends agree -- the NixOS and system-manager evaluations of the same input resolve to
 #      the identical tool set and manifest shape, proving modules/nixvault.nix's own "ONE FILE, BOTH
 #      BACKENDS" claim rather than merely asserting it in a comment.
+#   7. `lib.probeFact` (consumed from nixhost's own `lib/facts.nix` via this repo's `nixhost`
+#      flake input, see flake.nix) actually distinguishes, THROUGH this real module's wiring,
+#      "nixstorage not composed at all" from
+#      "nixstorage composed but `layout.images`/`disks` renamed" for BOTH facts this module reads
+#      -- before this group existed, NEITHER read was exercised by any check in this file at all.
+#      The renamed case warns exactly once per fact, naming the option path, and never fails the
+#      build on its own.
 { pkgs, lib, nixpkgs, system, nixvaultModule, systemManagerLib }:
 
 let
@@ -71,6 +78,61 @@ let
     nixvault.tier = "medium";
     nixvault.sources.knowledgeTree = [ "/example/knowledge-tree" ];
   });
+
+  # ── fact-wiring fixtures: `lib.probeFact` proven THROUGH the real modules/nixvault.nix ──────
+  #
+  # `nsImages`/`nsDisks` (and their warnings) are computed unconditionally whenever
+  # `nixvault.enable` is true -- see modules/nixvault.nix's own comment above
+  # `nixstorageLayoutImagesProbe` -- so `validBase` alone (device given directly, no
+  # `deviceFromLayout`/`fromDisk` anywhere) already exercises state (a): nixstorage composed
+  # nowhere in `cfg-small`/`cfg-medium`, and it must stay silent -- covered below via those
+  # existing fixtures directly.
+  #
+  # Faithful nixstorage, matching the real shape both probes read.
+  nixstorageFaithfulStub = {
+    options.nixstorage.layout.images = lib.mkOption {
+      type = lib.types.attrsOf lib.types.anything;
+      default = { };
+    };
+    options.nixstorage.disks = lib.mkOption {
+      type = lib.types.attrsOf lib.types.anything;
+      default = { };
+    };
+  };
+
+  cfg-facts-nixstorage-faithful = evalNixos (lib.recursiveUpdate validBase { imports = [ nixstorageFaithfulStub ]; });
+
+  # THE DECOYS: nixstorage's real option surfaces, each renamed ONE AT A TIME. Composes the SAME
+  # top-level `nixstorage` namespace the real sibling would (so `config ? nixstorage` reads true
+  # -- state (a), "not composed at all", must NOT be what these fixtures exercise), with the
+  # specific path under test renamed to a plausible neighbour -- while the OTHER fact this module
+  # also reads stays faithfully declared, so each fixture isolates exactly one probe. Without the
+  # faithful sibling declaration, the other probe would ALSO see its own path missing under
+  # `nixstorage` and warn too, for a reason that has nothing to do with the rename under test.
+  nixstorageLayoutRenamedStub = {
+    options.nixstorage.layout.partitions = lib.mkOption {
+      type = lib.types.attrsOf lib.types.anything;
+      default = { };
+    };
+    options.nixstorage.disks = lib.mkOption {
+      type = lib.types.attrsOf lib.types.anything;
+      default = { };
+    };
+  };
+
+  nixstorageDisksRenamedStub = {
+    options.nixstorage.layout.images = lib.mkOption {
+      type = lib.types.attrsOf lib.types.anything;
+      default = { };
+    };
+    options.nixstorage.blockDevices = lib.mkOption {
+      type = lib.types.attrsOf lib.types.anything;
+      default = { };
+    };
+  };
+
+  cfg-facts-layout-renamed = evalNixos (lib.recursiveUpdate validBase { imports = [ nixstorageLayoutRenamedStub ]; });
+  cfg-facts-disks-renamed = evalNixos (lib.recursiveUpdate validBase { imports = [ nixstorageDisksRenamedStub ]; });
 
   examplePull = {
     name = "example-publisher";
@@ -285,6 +347,45 @@ let
     (check "warnings/in-tier-source-is-silent"
       (cfg-nowarn.warnings == [ ])
       "warnings: ${builtins.toJSON cfg-nowarn.warnings}")
+
+    # --- 8. fact-wiring: lib.probeFact through the real module, not just lib/facts.nix's own ----
+    #
+    # Before this repo adopted lib.probeFact, NOTHING in this file exercised
+    # `nixstorage.layout.images`/`nixstorage.disks` at all -- these are the first checks to force
+    # either read.
+    (check "fact-wiring/no-nixstorage-composed-has-no-warnings"
+      (cfg-small.warnings == [ ])
+      "got warnings=${builtins.toJSON cfg-small.warnings}, expected none: state (a) -- nixstorage never imported at all -- must stay silent (cfg-small sets nixvault.device directly, never deviceFromLayout/fromDisk)")
+
+    (check "fact-wiring/nixstorage-faithful-has-no-warnings"
+      (cfg-facts-nixstorage-faithful.warnings == [ ])
+      "got warnings=${builtins.toJSON cfg-facts-nixstorage-faithful.warnings}, expected none: nixstorage composed with its real, un-renamed shape must produce zero warnings")
+
+    (check "fact-wiring/nixstorage-layout-images-renamed-warns-exactly-once"
+      (
+        let w = cfg-facts-layout-renamed.warnings; in
+        lib.length w == 1
+        && lib.hasInfix "nixstorage.layout.images" (lib.head w)
+        && lib.hasInfix "nixstorage" (lib.head w)
+      )
+      "got warnings=${builtins.toJSON cfg-facts-layout-renamed.warnings}, expected exactly one, naming nixstorage.layout.images -- the decoy renames it to nixstorage.layout.partitions while nixstorage itself IS composed, and nixvault.deviceFromLayout is unset, so nothing but the probe itself can be the source")
+
+    (check "fact-wiring/nixstorage-layout-images-renamed-does-not-fail-the-build"
+      (!(nixosBuildFails (lib.recursiveUpdate validBase { imports = [ nixstorageLayoutRenamedStub ]; })))
+      "state (c) must warn, not fail the build -- lib.probeFact defaults to mode = \"warn\", never \"assert\", for these two reads")
+
+    (check "fact-wiring/nixstorage-disks-renamed-warns-exactly-once"
+      (
+        let w = cfg-facts-disks-renamed.warnings; in
+        lib.length w == 1
+        && lib.hasInfix "nixstorage.disks" (lib.head w)
+        && lib.hasInfix "nixstorage" (lib.head w)
+      )
+      "got warnings=${builtins.toJSON cfg-facts-disks-renamed.warnings}, expected exactly one, naming nixstorage.disks -- the decoy renames it to nixstorage.blockDevices while nixstorage itself IS composed, and no luksVolumes entry sets fromDisk, so nothing but the probe itself can be the source")
+
+    (check "fact-wiring/nixstorage-disks-renamed-does-not-fail-the-build"
+      (!(nixosBuildFails (lib.recursiveUpdate validBase { imports = [ nixstorageDisksRenamedStub ]; })))
+      "state (c) must warn, not fail the build, same as the layout.images case above")
   ]
   ++ backendParityChecks;
 

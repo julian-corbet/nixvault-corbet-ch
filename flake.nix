@@ -21,9 +21,38 @@
     # nixosModules, which this module has no reason to install.
     nixfs.url = "github:julian-corbet/nixfs-corbet-ch";
     nixfs.inputs.nixpkgs.follows = "nixpkgs";
+
+    # nixhost IS an input, for exactly one thing: `lib.probeFact`/`lib.collectProbes`
+    # (github:julian-corbet/nixhost-corbet-ch, `lib/facts.nix`) -- the shared, plain-function fix
+    # for the cross-namespace defensive-read defect class this module's own
+    # `nixstorageLayoutImagesProbe`/`nixstorageDisksProbe` lean on (see nixhost's own
+    # `lib/facts.nix` header). This repo used to vendor a byte-identical copy of that file; it is
+    # now consumed instead -- exactly the same "one recipe, not a second copy" fix already applied
+    # to the f2fs catalogue this flake takes from nixfs above, rather than vendoring it too (see
+    # modules/nixvault.nix's own header on `nixfsCatalogue`). `probeFact`/`collectProbes` are
+    # closed over as plain function arguments alongside `nixfsCatalogue` (below), never
+    # `_module.args` -- for the identical reason `nixfsCatalogue` isn't: a module-argument name is
+    # a namespace every module composed alongside this one shares, and `_module.args` merges with
+    # `mergeOneOption`, which rejects a second definition even when the values are identical, so no
+    # `inputs.follows` pin could fix a collision there either.
+    #
+    # ONLY `nixpkgs.follows` is pinned here, never a follow on nixhost itself -- this repo has no
+    # way to reach into a CONSUMER's own separate `nixhost` input (e.g. infra's, or nixnas's, were
+    # nixnas ever to take one) to force them to share a revision. That reconciliation happens on
+    # the CONSUMER side, exactly the same shape infra already uses for the nixfs skew between this
+    # repo and nixnas (`inputs.nixvault.inputs.nixfs.follows = "nixfs"` plus a runtime assertion
+    # comparing both resolved catalogues -- see infra's own flake.nix). A future infra bump that
+    # picks up this commit needs the equivalent `inputs.nixvault.inputs.nixhost.follows =
+    # "nixhost"` (infra already takes nixhost directly) to avoid locking two separate nixhost
+    # revisions side by side; nothing about that is new or unproven, it is the exact mechanism
+    # infra already exercises for nixfs today.
+    nixhost = {
+      url = "github:julian-corbet/nixhost-corbet-ch";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
-  outputs = { self, nixpkgs, system-manager, nixfs }:
+  outputs = { self, nixpkgs, system-manager, nixfs, nixhost }:
     let
       lib = nixpkgs.lib;
       supportedSystems = [ "x86_64-linux" "aarch64-linux" ];
@@ -45,8 +74,19 @@
       # in this flake, producing the actual `{ config, lib, pkgs, ... }:` module -- the module
       # system never sees, and never has to call, the outer `{ nixfsCatalogue }:` layer, so nixfs
       # never enters `_module.args` at all. A consumer importing `nixosModules.default` still
-      # never has to know nixfs exists, let alone follow it themselves.
-      nixvaultModule = import ./modules/nixvault.nix { nixfsCatalogue = nixfs.lib.catalogue; };
+      # never has to know nixfs exists, let alone follow it themselves. The general rule this
+      # incident taught the family — a flake must never publish a fact through `_module.args` —
+      # is written down once, for every sibling, in nixfs's own README ("Family convention:
+      # consuming lib.catalogue ... never through `_module.args`").
+      #
+      # `probeFact`/`collectProbes` ride along in the SAME partial application, for the SAME
+      # reason -- see the `nixhost` input comment above. modules/nixvault.nix's outer layer is
+      # now `{ nixfsCatalogue, probeFact, collectProbes }:`; all three are supplied here, fully
+      # applying that layer before the module system ever sees the result.
+      nixvaultModule = import ./modules/nixvault.nix {
+        nixfsCatalogue = nixfs.lib.catalogue;
+        inherit (nixhost.lib) probeFact collectProbes;
+      };
     in
     {
       nixosModules.nixvault = nixvaultModule;

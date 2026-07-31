@@ -174,6 +174,7 @@ on purpose, because it needs the operator's passphrase.
 | `flake.nix` | Flake entry point: `nixosModules.default` / `systemManagerModules.default` (the same file, both backends), and `lib.manifest`. |
 | `modules/nixvault.nix` | The module: options, assertions, and the five lifecycle tools. |
 | `lib/manifest.nix` | Pure data: the tiers, their size budgets, and the manifest categories each one packs. |
+| *(no local `lib/facts.nix`)* | `lib.probeFact`/`lib.collectProbes` are consumed from [nixhost](https://github.com/julian-corbet/nixhost-corbet-ch)'s own `lib/facts.nix` via this repo's `nixhost` flake input (see `flake.nix`), not reinvented or vendored here. Distinguishes "nixstorage not composed" from "nixstorage composed but `layout.images`/`disks` renamed" for `nixvault.deviceFromLayout`/`luksVolumes[].fromDisk`'s own reads -- see nixhost's own header. |
 | `checks/` | Eval-time tests (including NixOS/system-manager backend parity) plus the real `pkgs.testers.nixosTest` lifecycle harness, all wired into `nix flake check`. |
 | `docs/index.md` | The design walkthrough: why passphrase-only, the create/update split, staleness, and the offsite-copy boundary. |
 | `experiments/` | Runnable trials with recorded results — see [`experiments/README.md`](experiments/README.md). |
