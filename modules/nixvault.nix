@@ -43,12 +43,9 @@
 # creates never gets anywhere near full on this container. Do not "fix" this by arguing back to
 # squashfs; the slow-flash problem squashfs actually had (whole-volume rewrites) is the one f2fs
 # solves, and the tight-partition problem f2fs actually had (in the rescue SLOT) simply does not
-# exist here. THIS RECIPE IS ONE, SHARED FACT, NOT A SECOND COPY: it used to be vendored here
-# (`lib/f2fs-vault-opts.nix`, a byte-for-byte copy of nixnas's own list) specifically so it
-# "cannot quietly drift" -- true, but the fix for a copy drifting is not a second copy, it is no
-# copy; nixfs is the one place this now lives, and if this vault's own write pattern ever needed
-# a genuinely different flag, that would be a parameter passed at THIS call site, never a second
-# variant sitting inside nixfs's own data.
+# exist here. THIS RECIPE IS ONE, SHARED FACT, NOT A SECOND COPY: nixfs is the one place it lives,
+# and if this vault's own write pattern ever needed a genuinely different flag, that would be a
+# parameter passed at THIS call site, never a second variant sitting inside nixfs's own data.
 #
 # COMPRESSION HERE IS A WRITE-SPEED WIN, NOT A CAPACITY ONE -- say so here so nobody later
 # "optimises" it away by pointing at the tier budgets and asking why a vault this small needs
@@ -105,8 +102,8 @@
 #   the whole manifest -- runs f2fs's compression release pass so those writes' reserved-but-unused
 #   blocks are freed back to the filesystem, then unmounts and closes it again. Opening a LUKS
 #   container needs its passphrase full stop -- there is no such thing as an unattended `luksOpen`
-#   for a container NOTHING ELSE HAS OPENED. That qualifier matters, and an earlier draft of this
-#   header missed it: on a host whose initrd already unlocks every declared LUKS member from ONE
+#   for a container NOTHING ELSE HAS OPENED. That qualifier matters: on a host whose initrd already
+#   unlocks every declared LUKS member from ONE
 #   operator passphrase (the kernel keyring caches it across the set), the vault can be declared
 #   as one more member and is open before userspace exists. `nixvault-update` adopts such a mapper
 #   instead of re-prompting, and closes only what it opened itself. The human act is then the ONE
@@ -118,14 +115,6 @@
 #   that changed are ever rewritten. This is the whole reason nixvault-create and nixvault-update
 #   are two different tools instead of one idempotent one -- they have completely different
 #   relationships to the passphrase.
-#
-#   (CORRECTED HERE having once been stated wrong: an earlier draft of the design record this
-#   module implements claimed updates need "no secret at all: luksOpen -> dd -> luksClose". That
-#   is false -- `luksOpen` needs the passphrase every time -- and the record itself now says so;
-#   see nixrescue.md §7.3's own correction. This module was already built the right way round
-#   before that record caught up: assemble unattended, commit attended, never the reverse. That
-#   correction is exactly as true of the f2fs-based commit above as it was of the old dd-a-squashfs
-#   one -- swapping the payload format never touched which half of the lifecycle needs the secret.)
 #
 #   STALENESS IS NOT COSMETIC HERE, and neither is DRIFT. A header backup or key that predates a
 #   passphrase change looks exactly like a working recovery path and is not one. `nixvault-verify`
@@ -227,16 +216,15 @@
 # `nixfsCatalogue` is a plain closure argument, partially applied by flake.nix at import time
 # (`import ./modules/nixvault.nix { nixfsCatalogue = nixfs.lib.catalogue; }`) — never
 # `_module.args`. A module-argument name is a GLOBAL namespace shared with anything else composed
-# alongside this module, and nixnas (a sibling appliance-adjacent flake, also consuming nixfs's
-# own catalogue) picked the exact same argument name for the exact same reason — correct in each
-# flake alone, and a hard "defined multiple times" eval failure the one time a consumer composed
-# both (infra's mkNixnas). `_module.args` merges with `mergeOneOption`, which rejects a second
-# definition even when the two values are identical, so no `inputs.follows` pin could have fixed
-# that either. Partial application closes over the value before it ever becomes a module argument
-# at all, ruling the collision out by construction: this file is a function of `nixfsCatalogue`
-# first, and ONLY THEN a NixOS/system-manager module of `{ config, lib, pkgs, ... }` — the module
-# system never calls the outer function, so it never has a chance to inject the standard module
-# args into it either.
+# alongside this module, and a sibling appliance flake consuming the same nixfs catalogue picked
+# the identical argument name for the identical reason — correct alone, a hard "defined multiple
+# times" eval failure the moment a consumer composes both. `_module.args` merges with
+# `mergeOneOption`, which rejects a second definition even when the two values are identical, so
+# no `inputs.follows` pin could have fixed that either. Partial application closes over the value
+# before it ever becomes a module argument at all, ruling the collision out by construction: this
+# file is a function of `nixfsCatalogue` first, and ONLY THEN a NixOS/system-manager module of
+# `{ config, lib, pkgs, ... }` — the module system never calls the outer function, so it never has
+# a chance to inject the standard module args into it either.
 { nixfsCatalogue, probeFact, collectProbes }:
 { config, lib, pkgs, ... }:
 
@@ -312,14 +300,14 @@ let
   # one-way in both cases -- nixstorage gains no knowledge of nixvault, ever.
   nixstorageLayoutImagesProbe = probeFact {
     inherit config;
-    namespace = "nixstorage";
-    path = [ "layout" "images" ];
+    namespace = "nixstorage.layout";
+    path = [ "images" ];
     fallback = { };
   };
   nixstorageDisksProbe = probeFact {
     inherit config;
-    namespace = "nixstorage";
-    path = [ "disks" ];
+    namespace = "nixstorage.disks";
+    path = [ ];
     fallback = { };
   };
   nsImages = nixstorageLayoutImagesProbe.value;
