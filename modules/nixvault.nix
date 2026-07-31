@@ -147,10 +147,17 @@
 #   words: run nixvault-update. `staleness.alertCommand` is a deliberate escape hatch rather than a
 #   hardcoded channel: a public module cannot know which operator's paging system to call.
 #
-# THE PACKING PIPELINE (nixvault-assemble): rm -rf the staging directory, re-populate it (generated
-# categories from `cryptsetup luksHeaderBackup` against `nixvault.luksVolumes`; static categories
-# from whatever paths `nixvault.sources.<category>` names). Unlike the old squashfs pipeline,
-# nothing is built here -- the staged directory tree IS the thing `nixvault-update` later `rsync`s
+# THE PACKING PIPELINE (nixvault-assemble): populate a SCRATCH SIBLING of the staging directory
+# (generated categories from `cryptsetup luksHeaderBackup` against `nixvault.luksVolumes`; static
+# categories from whatever paths `nixvault.sources.<category>` names), then rename it over the live
+# tree as the very last step. Never populated in place: every copy is unguarded and the script is
+# `set -e`, so one renamed or unreadable source aborts it partway -- and `nixvault-update` mirrors
+# this tree with `rsync --delete`, so a truncated tree does not merely fail, it DELETES the missing
+# categories from the container on the next commit. Building aside and publishing atomically means
+# a failed assemble leaves the last successful manifest exactly where it was. `nixvault-update`
+# independently re-derives the tree's hash and refuses to commit anything that does not match
+# `staged-hash`, so neither half relies on the other being correct. Nothing is built here -- the
+# staged directory tree IS the thing `nixvault-update` later `rsync`s
 # into the container, verbatim. The staged tree sits in plaintext in `stateDirectory` until
 # `nixvault-update` syncs it in; that is a live-host-local duplicate of material this host already
 # holds in plaintext somewhere (the sources it was copied from), not a new exposure, and
@@ -431,11 +438,32 @@ let
 
       ${treeHashFn}
 
-      staging="${cfg.stateDirectory}/stage"
+      # BUILD INTO A SIBLING, SWAP AT THE END -- never populate the live tree in place.
+      #
+      # This script is `set -e` and every copy below is unguarded, so ANY unreadable or
+      # renamed source path aborts it mid-populate. When the populate target was the live
+      # tree, and the live tree had already been `rm -rf`'d on the line above, that abort
+      # left the only copy of the manifest truncated at whichever source failed -- no old
+      # state to fall back to, because it had been deleted before the first copy ran.
+      #
+      # That is not a hypothetical. nixvault-update mirrors this tree with `rsync --delete`,
+      # and nothing orders it behind THIS script's exit status (`After=` is ordering, not a
+      # success condition). A single renamed source therefore silently deleted every
+      # category after it from the vault on the next commit -- the exact failure this
+      # module's staleness alarm exists to catch, arriving through the one path the alarm
+      # does not watch.
+      #
+      # So: `$staging` is now a scratch sibling, and `$final` is the live tree. The whole
+      # populate below is unchanged and still writes to `$staging`; only the last step
+      # publishes it. A failed run leaves `$final` exactly as the last SUCCESSFUL assemble
+      # left it, and the trap takes the scratch tree with it.
+      final="${cfg.stateDirectory}/stage"
+      staging="$final.new"
 
       install -d -m 0700 "${cfg.stateDirectory}"
       rm -rf "$staging"
       install -d -m 0700 "$staging"
+      trap 'rm -rf "$staging"' EXIT
 
       ${lib.optionalString (activeGeneratedCategories != [ ] && cfg.luksVolumes != [ ]) ''
         echo "nixvault-assemble: generating LUKS header backups and the device-role map..."
@@ -480,6 +508,29 @@ let
         install -d -m 0700 "$staging/${cat}"
         ${lib.concatMapStringsSep "\n" (src: ''cp -a --no-preserve=ownership "${src}" "$staging/${cat}/"'') cfg.sources.${cat}}
       '') activeStaticCategories}
+
+      # PUBLISH. Everything above succeeded, so this scratch tree is a complete manifest and
+      # may now replace the live one. Two renames rather than one: a directory cannot be
+      # renamed over a non-empty directory, so the outgoing tree steps aside first. That
+      # leaves a sub-millisecond window in which "$final" does not exist -- a concurrent
+      # nixvault-update lands on its own "no staged manifest" guard and exits non-zero
+      # without touching the container, which is the safe side of the race.
+      rm -rf "$final.old"
+      if [ -d "$final" ]; then
+        mv "$final" "$final.old"
+      fi
+      # `if !` rather than a bare mv: under `set -e` a bare failure would exit with the previous
+      # tree stranded at "$final.old" and NO live tree at all -- turning a rename failure into the
+      # very "there is no complete manifest" state this whole change exists to prevent. Put it
+      # back instead, and fail with the tree still intact.
+      if ! mv "$staging" "$final"; then
+        if [ -d "$final.old" ]; then mv "$final.old" "$final"; fi
+        echo "nixvault-assemble: could not publish the staged tree into $final -- the previous manifest has been left in place, unchanged." >&2
+        exit 1
+      fi
+      trap - EXIT
+      rm -rf "$final.old"
+      staging="$final"
 
       date -u +%s > "${cfg.stateDirectory}/last-assembled-timestamp"
 
@@ -566,6 +617,31 @@ let
 
       if [ ! -d "$staging" ] || [ ! -e "${cfg.stateDirectory}/staged-hash" ]; then
         echo "nixvault-update: no staged manifest at $staging -- run nixvault-assemble first." >&2
+        exit 1
+      fi
+
+      # THE TREE MUST BE THE ONE staged-hash DESCRIBES.
+      #
+      # "A staging directory exists" is not the same claim as "a complete assemble produced
+      # it", and the gap between the two is where this tool does its damage: the sync below
+      # is `rsync --delete`, so committing a tree that is missing categories DELETES them
+      # from the container. nixvault-assemble stamps staged-hash only after every source has
+      # been copied, so recomputing it here is an exact test of "this tree is a finished
+      # assemble" -- it catches an aborted run, a half-finished manual edit, and a tree that
+      # was truncated by anything else, all with the same comparison.
+      #
+      # Cheap next to what follows: rsync --checksum already reads every byte of this tree.
+      # nixvault_tree_hash is path-independent (it cd's in and finds '.'), so this compares
+      # equal across the assemble-time location and this one.
+      staged_recorded="$(cat "${cfg.stateDirectory}/staged-hash")"
+      staged_actual="$(nixvault_tree_hash "$staging")"
+      if [ "$staged_recorded" != "$staged_actual" ]; then
+        echo "nixvault-update: REFUSING TO COMMIT -- the staged manifest at $staging does not match staged-hash." >&2
+        echo "  recorded (last successful assemble): $staged_recorded" >&2
+        echo "  actual   (what is on disk now):      $staged_actual" >&2
+        echo "The tree has changed since the last assemble COMPLETED, so it is not known to be a full manifest." >&2
+        echo "Committing it would mirror it with --delete and drop whatever it is missing from the vault." >&2
+        echo "Run nixvault-assemble and fix whatever makes it fail before committing." >&2
         exit 1
       fi
 

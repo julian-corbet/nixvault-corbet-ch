@@ -278,5 +278,49 @@ pkgs.testers.nixosTest {
         assert commit_2_bytes < commit_1_bytes // 3, f"commit 2 (one small changed file) should write a small fraction of commit 1's bytes, but did not -- {detail}"
         assert commit_2_bytes < 3 * 1024 * 1024, f"commit 2 (one small changed file) wrote more than 3 MiB -- {detail}"
         print(f"nixvault incrementality proof: {detail}")
+
+    with subtest("a FAILED assemble leaves the live staging tree intact -- it is never populated in place"):
+        # THE REGRESSION. Every cp in the populate is unguarded and the script is `set -e`, so a
+        # source that stops existing (a repo renamed out from under the manifest is the real-world
+        # shape) aborts it partway through. When the populate target WAS the live tree -- which had
+        # already been rm -rf'd before the first copy -- that abort left the only copy of the
+        # manifest truncated at whichever source failed. nixvault-update then mirrors that tree with
+        # --delete, so the next commit deleted every category after the failure from the container.
+        good_hash = machine.succeed("cat /var/lib/nixvault/staged-hash").strip()
+        machine.succeed("mv /root/test-runbook.txt /root/test-runbook.txt.gone")
+        machine.fail("nixvault-assemble")
+
+        # The last SUCCESSFUL assemble's tree is still there, whole -- both the category that would
+        # have been rebuilt before the failure and the one that would have come after it.
+        machine.succeed("grep -q runbook-content-v2-CHANGED /var/lib/nixvault/stage/runbook/test-runbook.txt")
+        machine.succeed("cmp -s /root/test-bulk-file.bin /var/lib/nixvault/stage/recoveryKeys/test-bulk-file.bin")
+        # ...and still matches its recorded hash, so it is still a committable manifest.
+        assert machine.succeed("cat /var/lib/nixvault/staged-hash").strip() == good_hash
+        # The scratch tree the failed run was building is cleaned up, not left as debris.
+        machine.fail("test -e /var/lib/nixvault/stage.new")
+
+    with subtest("nixvault-update REFUSES a staging tree that does not match staged-hash"):
+        # The second, independent guard: whatever truncated the tree, the committer must not mirror
+        # it. Deleting a category by hand reproduces exactly what the committer would have seen.
+        machine.succeed("rm -rf /var/lib/nixvault/stage/recoveryKeys")
+        out = machine.fail("echo '${testPassphrase}' | nixvault-update 2>&1")
+        assert "REFUSING TO COMMIT" in out, out
+
+        # It refuses BEFORE opening the container, so the category the truncated tree was missing is
+        # still in the vault, byte-for-byte. This is the assertion the bug would have failed.
+        machine.succeed("echo '${testPassphrase}' | cryptsetup open /root/vault-test.img nixvault-test-verify-3")
+        machine.succeed("mount -t f2fs -o ro /dev/mapper/nixvault-test-verify-3 /mnt/nixvault-check")
+        machine.succeed("cmp -s /root/test-bulk-file.bin /mnt/nixvault-check/recoveryKeys/test-bulk-file.bin")
+        machine.succeed("umount /mnt/nixvault-check")
+        machine.succeed("cryptsetup close nixvault-test-verify-3")
+
+    with subtest("and the POSITIVE direction: restore the source, and assemble/commit work again"):
+        # A guard that never lets anything through is not a guard, it is an outage.
+        machine.succeed("mv /root/test-runbook.txt.gone /root/test-runbook.txt")
+        machine.succeed("nixvault-assemble")
+        machine.succeed("echo '${testPassphrase}' | nixvault-update")
+        out = machine.succeed("nixvault-verify")
+        assert "PASS: assembled content matches" in out, out
+        assert "DRIFTED" not in out, out
   '';
 }
