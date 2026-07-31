@@ -349,10 +349,6 @@ let
       "warnings: ${builtins.toJSON cfg-nowarn.warnings}")
 
     # --- 8. fact-wiring: lib.probeFact through the real module, not just lib/facts.nix's own ----
-    #
-    # Before this repo adopted lib.probeFact, NOTHING in this file exercised
-    # `nixstorage.layout.images`/`nixstorage.disks` at all -- these are the first checks to force
-    # either read.
     (check "fact-wiring/no-nixstorage-composed-has-no-warnings"
       (cfg-small.warnings == [ ])
       "got warnings=${builtins.toJSON cfg-small.warnings}, expected none: state (a) -- nixstorage never imported at all -- must stay silent (cfg-small sets nixvault.device directly, never deviceFromLayout/fromDisk)")

@@ -12,13 +12,10 @@
     system-manager.inputs.nixpkgs.follows = "nixpkgs";
 
     # nixfs — the filesystem domain, and the SOLE owner of the f2fs compression recipe (mkfs
-    # feature bits, mount options, the kernel floor they need). This vault's f2fs container used
-    # to VENDOR that recipe (lib/f2fs-vault-opts.nix, a byte-for-byte copy of nixnas's own
-    # store recipe) rather than depend on anything -- the header on that file said as much,
-    # explicitly, and even so it was still a second copy of one field-validated set of facts.
-    # It is data, not policy, so it is consumed as a lib value (`nixfs.lib.catalogue`), the
-    # same lower-layer-provides-a-lib category as nixtest's own fixtures -- never nixfs's own
-    # nixosModules, which this module has no reason to install.
+    # feature bits, mount options, the kernel floor they need). It is data, not policy, so it is
+    # consumed as a lib value (`nixfs.lib.catalogue`), the same lower-layer-provides-a-lib category
+    # as nixtest's own fixtures -- never nixfs's own nixosModules, which this module has no reason
+    # to install.
     nixfs.url = "github:julian-corbet/nixfs-corbet-ch";
     nixfs.inputs.nixpkgs.follows = "nixpkgs";
 
@@ -26,26 +23,20 @@
     # (github:julian-corbet/nixhost-corbet-ch, `lib/facts.nix`) -- the shared, plain-function fix
     # for the cross-namespace defensive-read defect class this module's own
     # `nixstorageLayoutImagesProbe`/`nixstorageDisksProbe` lean on (see nixhost's own
-    # `lib/facts.nix` header). This repo used to vendor a byte-identical copy of that file; it is
-    # now consumed instead -- exactly the same "one recipe, not a second copy" fix already applied
-    # to the f2fs catalogue this flake takes from nixfs above, rather than vendoring it too (see
-    # modules/nixvault.nix's own header on `nixfsCatalogue`). `probeFact`/`collectProbes` are
-    # closed over as plain function arguments alongside `nixfsCatalogue` (below), never
-    # `_module.args` -- for the identical reason `nixfsCatalogue` isn't: a module-argument name is
-    # a namespace every module composed alongside this one shares, and `_module.args` merges with
-    # `mergeOneOption`, which rejects a second definition even when the values are identical, so no
-    # `inputs.follows` pin could fix a collision there either.
+    # `lib/facts.nix` header). `probeFact`/`collectProbes` are closed over as plain function
+    # arguments alongside `nixfsCatalogue` (below), never `_module.args` -- for the identical
+    # reason `nixfsCatalogue` isn't: a module-argument name is a namespace every module composed
+    # alongside this one shares, and `_module.args` merges with `mergeOneOption`, which rejects a
+    # second definition even when the values are identical, so no `inputs.follows` pin could fix a
+    # collision there either.
     #
     # ONLY `nixpkgs.follows` is pinned here, never a follow on nixhost itself -- this repo has no
-    # way to reach into a CONSUMER's own separate `nixhost` input (e.g. infra's, or nixnas's, were
-    # nixnas ever to take one) to force them to share a revision. That reconciliation happens on
-    # the CONSUMER side, exactly the same shape infra already uses for the nixfs skew between this
-    # repo and nixnas (`inputs.nixvault.inputs.nixfs.follows = "nixfs"` plus a runtime assertion
-    # comparing both resolved catalogues -- see infra's own flake.nix). A future infra bump that
-    # picks up this commit needs the equivalent `inputs.nixvault.inputs.nixhost.follows =
-    # "nixhost"` (infra already takes nixhost directly) to avoid locking two separate nixhost
-    # revisions side by side; nothing about that is new or unproven, it is the exact mechanism
-    # infra already exercises for nixfs today.
+    # way to reach into a CONSUMER's own separate `nixhost` input to force them to share a
+    # revision. That reconciliation happens on the CONSUMER side, the same shape already used for
+    # the nixfs skew between this repo and nixnas (`inputs.nixvault.inputs.nixfs.follows = "nixfs"`
+    # plus a runtime assertion comparing both resolved catalogues): a consumer taking both this
+    # flake and nixhost directly needs the equivalent `inputs.nixvault.inputs.nixhost.follows =
+    # "nixhost"` to avoid locking two separate nixhost revisions side by side.
     nixhost = {
       url = "github:julian-corbet/nixhost-corbet-ch";
       inputs.nixpkgs.follows = "nixpkgs";
@@ -63,21 +54,20 @@
       # function argument -- a constant this flake closes over, never a per-host `config.nixfs.*`
       # read: a recipe is a fact about f2fs, not something a host declares. NOT
       # `_module.args.nixfsCatalogue`: a module-argument name is a GLOBAL namespace shared with
-      # anything else composed alongside this module, and nixnas (a sibling appliance-adjacent
-      # flake, also consuming nixfs's own catalogue) picked the exact same argument name for the
-      # exact same reason -- correct in each flake alone, and a hard "defined multiple times" eval
-      # failure the one time a consumer composed both (infra's mkNixnas). `_module.args` merges
-      # with `mergeOneOption`, which rejects a second definition even when the two values are
-      # identical, so no `inputs.follows` pin could have fixed that either. Partial application
-      # closes over the value before it ever becomes a module argument at all: `import
-      # ./modules/nixvault.nix { inherit nixfsCatalogue; }` fully applies the outer function here,
-      # in this flake, producing the actual `{ config, lib, pkgs, ... }:` module -- the module
-      # system never sees, and never has to call, the outer `{ nixfsCatalogue }:` layer, so nixfs
-      # never enters `_module.args` at all. A consumer importing `nixosModules.default` still
-      # never has to know nixfs exists, let alone follow it themselves. The general rule this
-      # incident taught the family — a flake must never publish a fact through `_module.args` —
-      # is written down once, for every sibling, in nixfs's own README ("Family convention:
-      # consuming lib.catalogue ... never through `_module.args`").
+      # anything else composed alongside this module, and a sibling appliance flake consuming the
+      # same nixfs catalogue picked the identical argument name for the identical reason -- correct
+      # alone, a hard "defined multiple times" eval failure the moment a consumer composes both.
+      # `_module.args` merges with `mergeOneOption`, which rejects a second definition even when
+      # the two values are identical, so no `inputs.follows` pin could have fixed that either.
+      # Partial application closes over the value before it ever becomes a module argument at all:
+      # `import ./modules/nixvault.nix { inherit nixfsCatalogue; }` fully applies the outer
+      # function here, in this flake, producing the actual `{ config, lib, pkgs, ... }:` module --
+      # the module system never sees, and never has to call, the outer `{ nixfsCatalogue }:`
+      # layer, so nixfs never enters `_module.args` at all. A consumer importing
+      # `nixosModules.default` still never has to know nixfs exists, let alone follow it
+      # themselves. The rule -- a flake must never publish a fact through `_module.args` -- is
+      # written down once, for every sibling, in nixfs's own README ("Family convention: consuming
+      # lib.catalogue ... never through `_module.args`").
       #
       # `probeFact`/`collectProbes` ride along in the SAME partial application, for the SAME
       # reason -- see the `nixhost` input comment above. modules/nixvault.nix's outer layer is
@@ -97,9 +87,9 @@
       # own "ONE FILE, BOTH BACKENDS" header for exactly why that is honest rather than lazy:
       # nixvault only ever touches option surface (environment.systemPackages,
       # systemd.services/timers, assertions, warnings) that system-manager supports identically
-      # to NixOS, confirmed by reading its actual module source, not assumed. The partial
-      # application above is backend-agnostic too -- it happens before either backend's module
-      # system ever runs, so both get the identical already-applied module.
+      # to NixOS. The partial application above is backend-agnostic too -- it happens before
+      # either backend's module system ever runs, so both get the identical already-applied
+      # module.
       systemManagerModules.nixvault = nixvaultModule;
       systemManagerModules.default = self.systemManagerModules.nixvault;
 

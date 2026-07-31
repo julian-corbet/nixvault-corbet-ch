@@ -15,9 +15,8 @@
 # possible choice: nothing here ever touches `/dev/vdX`, `virtualisation.emptyDiskImages`, or any
 # other block-device machinery, only a file that lives and dies with the VM.
 #
-# WHAT THIS PROVES, in the order it happens below -- the corrected lifecycle from
-# nixrescue.md §7.3 (assemble/compare/alert unattended, commit attended), not the "no secret at
-# all" claim that record's own earlier draft made and later retracted:
+# WHAT THIS PROVES, in the order it happens below -- the full lifecycle (assemble/compare/alert
+# unattended, commit attended):
 #
 #   1. nixvault-create formats a REAL LUKS2 container with a random master key, then adds the
 #      operator's own passphrase, then REFUSES to reformat that same container a second time.
