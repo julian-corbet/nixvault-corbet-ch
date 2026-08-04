@@ -683,16 +683,36 @@ let
         opened_here=1
       fi
 
-      mnt="$(mktemp -d)"
+      # ADOPT AN ALREADY-MOUNTED (OR AUTOMOUNT-ARMED) mountPoint RATHER THAN A PRIVATE MOUNT --
+      # the exact "adopt, never close what you did not open" rule the LUKS mapper above already
+      # follows, now one layer up. `mountpoint -q` reads true for an idle automount trigger too
+      # (it has its own distinct device/inode from its parent before ever establishing for real),
+      # so this correctly adopts either an already-mounted mountPoint or one merely armed for
+      # first access -- writing into it below is what triggers establishment either way.
+      ${lib.optionalString (cfg.mountPoint != null) ''
+        if mountpoint -q "${cfg.mountPoint}" 2>/dev/null; then
+          echo "nixvault-update: ${cfg.mountPoint} is already mounted (or armed) -- adopting it instead of a private mount."
+          mnt="${cfg.mountPoint}"
+          adopted_mount=1
+        fi
+      ''}
+      adopted_mount="''${adopted_mount:-0}"
+      if [ "$adopted_mount" = 0 ]; then
+        mnt="$(mktemp -d)"
+      fi
       cleanup() {
-        umount "$mnt" 2>/dev/null || true
-        rmdir "$mnt" 2>/dev/null || true
+        if [ "$adopted_mount" = 0 ]; then
+          umount "$mnt" 2>/dev/null || true
+          rmdir "$mnt" 2>/dev/null || true
+        fi
         [ "$opened_here" = 1 ] && cryptsetup close "$mapper" 2>/dev/null || true
       }
       trap cleanup EXIT
 
-      echo "nixvault-update: mounting the vault's f2fs filesystem..."
-      mount -t f2fs -o "${f2fsMountOptionsStr}" "/dev/mapper/$mapper" "$mnt"
+      if [ "$adopted_mount" = 0 ]; then
+        echo "nixvault-update: mounting the vault's f2fs filesystem..."
+        mount -t f2fs -o "${f2fsMountOptionsStr}" "/dev/mapper/$mapper" "$mnt"
+      fi
 
       # THE INCREMENTAL COMMIT -- the whole reason this module dropped squashfs (see this file's
       # own header). Plain rsync (never --inplace: a changed file is written to a NEW temp file
@@ -720,14 +740,19 @@ let
       # container already holds this manifest".
       committed_hash="$(nixvault_tree_hash "$mnt")"
 
-      umount "$mnt"
-      rmdir "$mnt"
-      # Same rule as the trap: close ONLY what this tool opened. On a host where the
-      # initrd chain-opened the container off the operator's single boot passphrase,
-      # closing it here would tear the vault down after the first commit and every
-      # later one would find it gone -- turning an unattended lifecycle into a silent
-      # one-shot. (The trap was guarded first and this line was missed; the symptom was
-      # exactly that: adoption logged correctly, mapper absent afterwards.)
+      # Same rule as the trap, and now the same rule TWICE over: close/unmount ONLY what this
+      # tool itself opened/mounted. On a host where the initrd chain-opened the container off
+      # the operator's single boot passphrase, closing it here would tear the vault down after
+      # the first commit and every later one would find it gone -- turning an unattended
+      # lifecycle into a silent one-shot. (The mapper half of this was guarded first and the
+      # explicit close on the success path was missed; the symptom was exactly that: adoption
+      # logged correctly, mapper absent afterwards.) mountPoint follows identically: unmounting
+      # an adopted mountPoint here would tear down the one persistent view this option exists to
+      # provide, on every single commit.
+      if [ "$adopted_mount" = 0 ]; then
+        umount "$mnt"
+        rmdir "$mnt"
+      fi
       [ "$opened_here" = 1 ] && cryptsetup close "$mapper" || true
       trap - EXIT
 
@@ -931,7 +956,44 @@ in
     mapperName = lib.mkOption {
       type = lib.types.str;
       default = "vault";
-      description = "The /dev/mapper/<name> this vault is opened as while nixvault-update mounts and syncs into it (nixvault-create uses '<name>-create' for its own one-time mkfs pass, so the two never collide). Only matters while a script in this module is actively running -- the container is closed again before either tool exits.";
+      description = "The /dev/mapper/<name> this vault is opened as while nixvault-update mounts and syncs into it (nixvault-create uses '<name>-create' for its own one-time mkfs pass, so the two never collide). Only matters while a script in this module is actively running -- the container is closed again before either tool exits, UNLESS the mapper was adopted already-open (chain-open host) or mountPoint is set (see that option).";
+    };
+
+    mountPoint = lib.mkOption {
+      type = lib.types.nullOr lib.types.path;
+      default = null;
+      example = "/vault";
+      description = ''
+        Keep the vault's f2fs filesystem mounted here for as long as the LUKS mapper stays open,
+        instead of the default of only ever mounting it privately, transiently, for the duration
+        of a single nixvault-update run.
+
+        WHY THIS IS OPT-IN, NOT THE DEFAULT. The two layers of this vault have always followed the
+        SAME "adopt an already-open resource, never close what you did not open" rule (see this
+        file's own header, THE LIFECYCLE) -- but until now that rule only ever applied to the LUKS
+        mapper. The filesystem MOUNT on top of it was still torn down every single cycle even on a
+        chain-open host where the mapper itself never closes, because nothing outside
+        nixvault-update ever had a reason to read the vault's contents directly. A host that wants
+        the vault BROWSABLE at a stable path -- an operator inspecting it, or a file manager
+        listing it -- needs that mount to persist the same way the mapper already does. Left null,
+        every existing host's behaviour (including the lifecycle-vm-test) is completely unchanged.
+
+        HOW IT WORKS. When set, a `systemd.automount` arms this path so it establishes on first
+        access rather than racing the mapper's own availability at boot (correct on BOTH a
+        chain-open host, where the mapper may not exist until an operator types the passphrase
+        seconds or minutes into boot, and a host where nothing opens the mapper until
+        nixvault-update itself runs). `nixvault-update` then checks this path with `mountpoint -q`
+        before doing anything: found already mounted (or armed via the automount, which reads the
+        same to `mountpoint -q`) -- it rsyncs straight into it and leaves it mounted on exit, the
+        exact "adopt, never close" rule the mapper already follows, now one layer up. Not found --
+        behaviour is byte-for-byte what it always was: a private `mktemp -d`, mounted, synced,
+        unmounted, every time.
+
+        Requires the mapper to actually be open by the time this path is accessed -- mountPoint
+        does not open anything itself, and never supplies a passphrase. On a chain-open host that
+        is the boot-time unlock; on any other host, nothing establishes this mount until
+        nixvault-update itself opens the mapper for a commit.
+      '';
     };
 
     stateDirectory = lib.mkOption {
@@ -1296,6 +1358,29 @@ in
         verifyScript
       ] ++ lib.optional cfg.exportTool.enable exportScript
       ++ map mkHeaderPullScript cfg.headerBackupPull;
+
+      # mountPoint's automount, not a plain systemd.mounts `wantedBy`: arming rather than starting
+      # at boot means this never races the mapper's own availability (a chain-open host may not
+      # finish its boot-time passphrase prompt for several seconds or longer; a non-chain-open
+      # host has no mapper at all until nixvault-update itself opens one). First access -- an
+      # operator `ls`ing the path, or nixvault-update's own `mountpoint -q` probe -- triggers
+      # establishment on demand, and systemd auto-derives the ordering against the mapper's own
+      # device unit from `what`, so a mapper that is not there yet just makes the automount wait,
+      # never fail. No `nofail`/`Restart=` needed for the identical reason autofs-style mounts
+      # never need it elsewhere in this fleet: an unmounted trigger sitting armed is not a failure
+      # state.
+      systemd.mounts = lib.optional (cfg.mountPoint != null) {
+        what = "/dev/mapper/${cfg.mapperName}";
+        where = cfg.mountPoint;
+        type = "f2fs";
+        options = f2fsMountOptionsStr;
+      };
+
+      systemd.automounts = lib.optional (cfg.mountPoint != null) {
+        where = cfg.mountPoint;
+        wantedBy = [ "multi-user.target" ];
+        automountConfig.TimeoutIdleSec = "600";
+      };
 
       # nixvault-create and nixvault-update are deliberately absent from systemd entirely, the same
       # posture as nixboot-enroll-sb: both need a human-known passphrase (a brand-new one for create,
