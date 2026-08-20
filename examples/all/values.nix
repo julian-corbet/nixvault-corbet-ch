@@ -16,8 +16,9 @@
 #     than anchoring a second one, names where its index and its queue can be reached, sources two
 #     credentials from a Secret key by key, is told the URL people reach it at, runs as uid 0, is
 #     pinned by digest — which is what the grammar asks for and what the first one deliberately does
-#     not do — and keeps one of its directories under a name the cluster already had for it, while
-#     the first one takes the catalogue's own names unchanged.
+#     not do — keeps one of its directories under a name the cluster already had for it while the
+#     first one takes the catalogue's own names unchanged, and is ADOPTED, because it was already
+#     running there, while the first one is created from nothing.
 {
   # Required by the nixidy environment itself, not by any module here.
   nixidy.target.repository = "https://example.com/example-org/example-gitops.git";
@@ -64,6 +65,11 @@
     exposure = "nb";
     slot = 13;
     publicUrl = "https://videos.example.com";
+    # This one was ALREADY RUNNING in the imaginary cluster, under the hand-written manifest this
+    # declaration replaces — so its Application takes the existing objects over instead of treating
+    # them as a change to make. The other archive is created from nothing and says nothing here,
+    # which is the whole point: adoption is this cluster's history, not a property of the software.
+    adopt = true;
     requires.index.endpoint = "http://example-index:9200";
     requires.queue.endpoint = "redis://example-queue:6379";
     credentials.ELASTIC_PASSWORD = {

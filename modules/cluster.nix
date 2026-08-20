@@ -119,7 +119,7 @@ let
   mkApp = x:
     let inherit (x) entry w; in
     {
-      inherit (w) namespace createNamespace project exposure scaling;
+      inherit (w) namespace createNamespace project exposure scaling adopt;
       image = imageOf entry w;
       ports = portsOf entry;
       state = stateOf entry w;
@@ -509,6 +509,28 @@ let
         between requests, which is what makes zero replicas lossy rather than merely cold — and
         declaring the unsafe combination is refused rather than warned about. An interrupted archive
         run is not a slow request; it is a page that may not be there tomorrow.
+      '';
+    };
+
+    adopt = lib.mkOption {
+      type = lib.types.bool;
+      default = false;
+      description = ''
+        Whether this workload's Application TAKES OVER objects that already exist in the cluster —
+        rendered with server-side apply and server-side diff, so the delivery controller compares
+        against what the API server actually holds rather than against a client-side reconstruction
+        of it.
+
+        A DECLARATION SAYS THIS AND THE CATALOGUE CANNOT. Whether an object is already there is one
+        cluster's history, never a fact about the software: the same archive, adopted where it used
+        to run under a hand-written manifest and created from nothing on a second cluster, is the
+        same archive and differs here and nowhere else.
+
+        It matters most for exactly what this repository holds. An archive is a single writer over
+        directories it must not share, so its Deployment cannot roll — the old pod stops before the
+        new one starts — which makes any diff the controller decides to act on downtime rather than
+        a restart nobody notices. Adoption shrinks that diff to what genuinely changed; it does not
+        make it zero. Render it, compare it against what is live, and decide knowingly.
       '';
     };
 

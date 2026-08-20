@@ -127,6 +127,17 @@ pkgs.runCommand "nixvault-cluster-render"
     check "$(basename $f) no nodePort" "null" "$(y '.spec.ports[0].nodePort' $f)"
   done
 
+  # BOTH DIRECTIONS, because "adopt" is only meaningful as a difference: an Application that always
+  # asked for server-side apply would prove nothing, and an archive created from nothing must be
+  # left alone rather than quietly compared against the API server.
+  echo "== the archive that was already there is taken over, and the one that was not is not =="
+  pagesa="$manifests/apps/Application-example-pages.yaml"
+  videosa="$manifests/apps/Application-example-videos.yaml"
+  check "videos adopts: SSA"  "ServerSideApply=true" "$(y '.spec.syncPolicy.syncOptions[0]' $videosa)"
+  check "videos adopts: SSD"  "ServerSideDiff=true"  "$(y '.metadata.annotations."argocd.argoproj.io/compare-options"' $videosa)"
+  check "pages: no SSA"       "null"                 "$(y '.spec.syncPolicy.syncOptions' $pagesa)"
+  check "pages: no SSD"       "null"                 "$(y '.metadata.annotations."argocd.argoproj.io/compare-options"' $pagesa)"
+
   # `-L` is load-bearing: the rendered tree is SYMLINKS into the store, so a plain `-type f` matches
   # nothing and returns a confident zero. A count that can only ever be zero is worse than no check,
   # because it passes the moment somebody expects zero.

@@ -150,6 +150,9 @@ let
     "an archive is always resident" =
       pages.scaling == "always" && videos.scaling == "always";
 
+    "whether the objects were already there is the declaration's to say, and reaches the grammar" =
+      videos.adopt && !pages.adopt;
+
     # ── Unwritable, not merely refused ────────────────────────────────────────────────────────
     "software the catalogue does not hold is not a value this option has" =
       !renders (with' { nixvault.archives.example-pages.app = "nonesuch"; });
