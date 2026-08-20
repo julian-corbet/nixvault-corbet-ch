@@ -1,5 +1,5 @@
 {
-  description = "nixvault -- a passphrase-only, per-host disaster-recovery vault (LUKS -> f2fs), assembled from a curated manifest and built on the host it protects";
+  description = "nixvault -- keeping the copy that outlives the original: a passphrase-only, per-host disaster-recovery vault (LUKS -> f2fs) built on the host it protects, and the archives that keep the web and the video somebody chose to save";
 
   inputs = {
     # Used by `checks` only. The module itself takes `pkgs` from the consuming evaluation and never
@@ -41,9 +41,35 @@
       url = "github:julian-corbet/nixhost-corbet-ch";
       inputs.nixpkgs.follows = "nixpkgs";
     };
+
+    # ── THE CLUSTER HALF'S TWO INPUTS, USED BY `checks` ALONE ────────────────────────────────────
+    #
+    # Neither reaches anything this flake exports. `nixidyModules.nixvault` is a plain module file
+    # that takes `config`/`lib` from whichever evaluation composes it, exactly like the two host
+    # backends above, so a consumer rendering it pays for neither input.
+    #
+    # They exist because `nix flake check` evaluates no module output on its own: without a renderer
+    # and the grammar to render into, the cluster half would be a module verified by nobody, passing
+    # CI on flake syntax alone.
+
+    # The renderer the cluster module defines into.
+    nixidy = {
+      url = "github:arnarg/nixidy";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
+
+    # THE APP GRAMMAR THIS REPOSITORY CONSUMES -- the point being proven rather than a shortcut. A
+    # consumer imports the grammar itself, and this input is here so the checks can render the
+    # cluster module through the REAL grammar and assert what comes out, rather than asserting that a
+    # module which merely mentions `nixk3s.apps` evaluates.
+    nixk3s = {
+      url = "github:julian-corbet/nixk3s-corbet-ch";
+      inputs.nixpkgs.follows = "nixpkgs";
+      inputs.nixidy.follows = "nixidy";
+    };
   };
 
-  outputs = { self, nixpkgs, system-manager, nixfs, nixhost }:
+  outputs = { self, nixpkgs, system-manager, nixfs, nixhost, nixidy, nixk3s }:
     let
       lib = nixpkgs.lib;
       supportedSystems = [ "x86_64-linux" "aarch64-linux" ];
@@ -93,16 +119,50 @@
       systemManagerModules.nixvault = nixvaultModule;
       systemManagerModules.default = self.systemManagerModules.nixvault;
 
+      # The cluster plane: the archives that run in the cluster rather than on the host the vault
+      # protects. A different SHAPE from the two backends above -- it renders Kubernetes objects
+      # through a renderer, not systemd units through a backend -- and the same subject, which is
+      # why it lives here: an archive keeps the copy that outlives the original, and so does a
+      # vault. Only one module in the class, so `.default` is honest rather than invented.
+      nixidyModules.nixvault = ./modules/cluster.nix;
+      nixidyModules.default = self.nixidyModules.nixvault;
+
       # The manifest, exposed so a consumer can inspect the tier/category shape without re-reading
       # the file -- same reason nixfs exposes its catalogue.
       lib.manifest = import ./lib/manifest.nix { };
 
+      # The archive catalogue, same reason: what each one IS, inspectable without re-reading the
+      # file and without composing the module.
+      lib.archives = (import ./lib/archives.nix { }).archives;
+
       checks = forAllSystems (system:
-        import ./checks {
+        let
           pkgs = pkgsFor system;
-          inherit lib nixpkgs system;
+          clusterArgs = {
+            inherit pkgs lib nixidy;
+            appsModule = nixk3s.nixidyModules.apps;
+            clusterModule = self.nixidyModules.nixvault;
+            values = ./examples/all/values.nix;
+          };
+        in
+        import ./checks {
+          inherit pkgs lib nixpkgs system;
           nixvaultModule = self.nixosModules.nixvault;
           systemManagerLib = system-manager.lib;
+        }
+        # x86_64-linux only, and narrow ON PURPOSE. Both cluster checks build a real nixidy
+        # environment, so a declared platform that cannot be built here is a platform `nix flake
+        # check` skips while exiting 0 -- a check that passed having tested nothing. Narrow the
+        # claim rather than weaken the check; the vault half above genuinely runs on both.
+        // lib.optionalAttrs (system == "x86_64-linux") {
+          # The cluster module's own resolution and every guard it makes, in BOTH directions: an
+          # empty surface renders nothing, a declared one resolves, and each refusal gets a
+          # declaration that must be refused.
+          cluster-eval = import ./checks/cluster-eval.nix clusterArgs;
+
+          # The manifests that actually come out, read back off the rendered bytes rather than off
+          # the options that produced them.
+          cluster-render = import ./checks/cluster-render.nix clusterArgs;
         });
 
       formatter = forAllSystems (system: (pkgsFor system).nixpkgs-fmt);

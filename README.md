@@ -1,8 +1,10 @@
 # nixvault
 
-**A passphrase-only, per-host disaster-recovery vault — LUKS → a compressed,
-read-write f2fs filesystem, built on the host it protects, with no TPM, no
-keyfile, and no machine binding.**
+**Keeping the copy that outlives the original.** A passphrase-only, per-host
+disaster-recovery vault — LUKS → a compressed, read-write f2fs filesystem,
+built on the host it protects, with no TPM, no keyfile, and no machine
+binding — **and the archives that keep the pages and the videos somebody
+chose to save.**
 
 ## What nixvault is
 
@@ -59,6 +61,46 @@ passphrase:
   for why an offsite copy cannot carry the same keyslot the local container
   does.
 
+## The cluster half: archives
+
+An archive and a backup are not the same promise, and the difference is why
+archives live in a vault repository rather than beside a backup tool. A backup
+is a copy of a live system, kept so the system can be restored to what it was;
+once the original is back, the copy has done its job. An archive is a copy kept
+so the thing survives the **original** — the page that goes behind a paywall,
+the video that is taken down, the site that stops paying for a domain. There is
+nothing left to restore to. That is the same promise the vault half makes about
+a LUKS header and an age key.
+
+So `nixidyModules.default` is a second plane, for archives that run in a
+cluster rather than tools that run on the host:
+
+- [`lib/archives.nix`](lib/archives.nix) is the catalogue — what each archive
+  **is**, wherever anyone runs it: the port, the directories it keeps and which
+  of them grows without bound, which environment variables must carry a
+  credential rather than a value, what it must be told about itself, and which
+  workloads it needs somebody else to run.
+- [`modules/cluster.nix`](modules/cluster.nix) is a translator, not a
+  Kubernetes implementation. It defines into the
+  [nixk3s](https://github.com/julian-corbet/nixk3s-corbet-ch) app grammar and
+  renders no Kubernetes object of its own.
+
+The two halves of every fact are kept apart and neither can supply the other's:
+the catalogue says *where* a directory lives inside the container and a
+declaration says *what backs it*; the catalogue says *which variable* a
+companion's URL is read from and a declaration says *what that URL is*; the
+catalogue says *which variable* must carry a credential and a declaration says
+*which Secret holds it*. A declaration missing its half is an eval error, not a
+surprise at runtime — including the archival ones: a growing directory may not
+be handed to the kubelet to chown recursively on every pod start, and an
+archive may not be idled to zero, because it does its real work between
+requests.
+
+```nix
+# In a nixidy environment that already imports the nixk3s app grammar:
+imports = [ inputs.nixvault.nixidyModules.default ];
+```
+
 ## Why f2fs, not squashfs
 
 The vault typically lives on a really slow USB stick. An earlier version of
@@ -98,6 +140,13 @@ container on a loopback file, including both failing directions (a wrong
 passphrase, a stale/drifted vault) and a measured proof that a second commit
 touching one small file writes materially less than the first commit of the
 whole manifest — see "Why f2fs, not squashfs" below.
+
+The cluster half is covered the same way and by the same command: `cluster-eval`
+renders the example surface through the real renderer and the real app grammar
+and makes every guard fire on a declaration that must be refused, and
+`cluster-render` reads the promises back off the rendered bytes — including
+mount order, which is invisible in the option tree and decides whether a nested
+archive is visible to the application at all.
 
 ## Two backends, one file
 
@@ -171,11 +220,14 @@ on purpose, because it needs the operator's passphrase.
 
 | Path | Purpose |
 |---|---|
-| `flake.nix` | Flake entry point: `nixosModules.default` / `systemManagerModules.default` (the same file, both backends), and `lib.manifest`. |
+| `flake.nix` | Flake entry point: `nixosModules.default` / `systemManagerModules.default` (the same file, both backends), `nixidyModules.default` (the cluster half), `lib.manifest` and `lib.archives`. |
 | `modules/nixvault.nix` | The module: options, assertions, and the five lifecycle tools. |
 | `lib/manifest.nix` | Pure data: the tiers, their size budgets, and the manifest categories each one packs. |
+| `lib/archives.nix` | Pure data: the archive catalogue — what each archive is, wherever anyone runs it. No address, no path, no namespace, no credential. |
+| `modules/cluster.nix` | The cluster half: declare which archives run in the cluster, translate them into the nixk3s app grammar, and refuse a declaration whose half of a fact is missing. |
+| `examples/all/values.nix` | Placeholder values the cluster checks render. Nothing in it is real. |
 | *(no local `lib/facts.nix`)* | `lib.probeFact`/`lib.collectProbes` are consumed from [nixhost](https://github.com/julian-corbet/nixhost-corbet-ch)'s own `lib/facts.nix` via this repo's `nixhost` flake input (see `flake.nix`), not reinvented or vendored here. Distinguishes "nixstorage not composed" from "nixstorage composed but `layout.images`/`disks` renamed" for `nixvault.deviceFromLayout`/`luksVolumes[].fromDisk`'s own reads -- see nixhost's own header. |
-| `checks/` | Eval-time tests (including NixOS/system-manager backend parity) plus the real `pkgs.testers.nixosTest` lifecycle harness, all wired into `nix flake check`. |
+| `checks/` | Eval-time tests (including NixOS/system-manager backend parity), the real `pkgs.testers.nixosTest` lifecycle harness, and the cluster half's `cluster-eval` / `cluster-render` pair — all wired into `nix flake check`. |
 | `docs/index.md` | The design walkthrough: why passphrase-only, the create/update split, staleness, and the offsite-copy boundary. |
 | `experiments/` | Runnable trials with recorded results — see [`experiments/README.md`](experiments/README.md). |
 | `studies/` | Written investigations that motivate design decisions — see [`studies/README.md`](studies/README.md). |
