@@ -58,6 +58,16 @@ pkgs.runCommand "nixvault-cluster-render"
   check "videos mount 0" "/cache"   "$(y '.spec.template.spec.containers[0].volumeMounts[0].mountPath' $videosd)"
   check "videos mount 1" "/youtube" "$(y '.spec.template.spec.containers[0].volumeMounts[1].mountPath' $videosd)"
 
+  # The name is not in the mount PATH, it is in the volume the mount points at -- so it is read off
+  # both ends, which is also the only way to catch a rename that lands on one of them and not the
+  # other and leaves the pod referring to a volume that is not there.
+  echo "== a directory the cluster already named keeps that name on both ends of the mount =="
+  check "videos volume name"   "videos" "$(y '.spec.template.spec.containers[0].volumeMounts[1].name' $videosd)"
+  check "videos volume backed" "/example/archive/videos" "$(y '.spec.template.spec.volumes[] | select(.name=="videos") | .hostPath.path' $videosd)"
+  check "videos old name gone" "0" "$(y '[.spec.template.spec.volumes[] | select(.name=="media")] | length' $videosd)"
+  check "videos unrenamed one" "cache" "$(y '.spec.template.spec.containers[0].volumeMounts[0].name' $videosd)"
+  check "pages unrenamed one"  "snapshots" "$(y '.spec.template.spec.containers[0].volumeMounts[1].name' $pagesd)"
+
   echo "== what backs a directory comes from the declaration, and strictly by default =="
   check "pages index claim"   "example-pages-index"    "$(y '.spec.template.spec.volumes[] | select(.name=="data") | .persistentVolumeClaim.claimName' $pagesd)"
   check "pages archive path"  "/example/archive/pages" "$(y '.spec.template.spec.volumes[] | select(.name=="snapshots") | .hostPath.path' $pagesd)"

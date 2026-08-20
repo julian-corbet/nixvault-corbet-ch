@@ -87,14 +87,19 @@ cluster rather than tools that run on the host:
 
 The two halves of every fact are kept apart and neither can supply the other's:
 the catalogue says *where* a directory lives inside the container and a
-declaration says *what backs it*; the catalogue says *which variable* a
-companion's URL is read from and a declaration says *what that URL is*; the
-catalogue says *which variable* must carry a credential and a declaration says
-*which Secret holds it*. A declaration missing its half is an eval error, not a
+declaration says *what backs it* and *what it is called* once it is an object in
+a cluster; the catalogue says *which variable* a companion's URL is read from
+and a declaration says *what that URL is*; the catalogue says *which variable*
+must carry a credential and a declaration says *which Secret holds it*. A declaration missing its half is an eval error, not a
 surprise at runtime — including the archival ones: a growing directory may not
 be handed to the kubelet to chown recursively on every pod start, and an
 archive may not be idled to zero, because it does its real work between
 requests.
+
+Naming is a declaration's half for one reason worth stating: a volume name
+lives inside the pod template, so an archive that already runs somewhere can be
+adopted under the names its objects already carry — the same manifest, byte for
+byte — instead of trading a restart of a single-writer index for a spelling.
 
 ```nix
 # In a nixidy environment that already imports the nixk3s app grammar:

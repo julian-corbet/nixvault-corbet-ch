@@ -14,9 +14,10 @@
 #     kubelet own the small directory while keeping it off the growing one;
 #   - an archive that is the front of a stack it does not render: it joins that namespace rather
 #     than anchoring a second one, names where its index and its queue can be reached, sources two
-#     credentials from a Secret key by key, is told the URL people reach it at, runs as uid 0 and is
+#     credentials from a Secret key by key, is told the URL people reach it at, runs as uid 0, is
 #     pinned by digest — which is what the grammar asks for and what the first one deliberately does
-#     not do.
+#     not do — and keeps one of its directories under a name the cluster already had for it, while
+#     the first one takes the catalogue's own names unchanged.
 {
   # Required by the nixidy environment itself, not by any module here.
   nixidy.target.repository = "https://example.com/example-org/example-gitops.git";
@@ -73,7 +74,14 @@
       secret = "example-videos-credentials";
       key = "admin-password";
     };
-    state.media.hostPath = "/example/archive/videos";
+    # The archive tree was already an object in this imaginary cluster before the declaration
+    # existed, under a name somebody typed by hand. Saying so renders the manifest that is already
+    # there rather than a new one, which for an archive is the difference between adopting a
+    # workload and stopping it.
+    state.media = {
+      hostPath = "/example/archive/videos";
+      volumeName = "videos";
+    };
     state.cache.hostPath = "/example/state/videos-cache";
   };
 }

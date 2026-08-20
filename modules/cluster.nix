@@ -26,6 +26,7 @@
 # split made into an eval error:
 #
 #   the catalogue says WHERE a directory lives inside the container   — a declaration says WHAT BACKS IT
+#   the catalogue says WHICH DIRECTORIES the software keeps           — a declaration says WHAT EACH ONE IS CALLED
 #   the catalogue says WHICH VARIABLE a companion's URL is read from  — a declaration says WHAT THAT URL IS
 #   the catalogue says WHICH VARIABLE must carry a credential         — a declaration says WHICH SECRET HOLDS IT
 #   the catalogue says the image reads its ids from the environment   — a declaration says WHICH IDENTITY
@@ -49,14 +50,21 @@ let
 
   portsOf = entry: lib.mapAttrs (_: number: { inherit number; }) entry.ports;
 
+  # WHAT A DIRECTORY IS CALLED once it is an object in a cluster. The catalogue's key is this
+  # repository's name for a directory and it is what a declaration writes against; the name the
+  # rendered volume carries is a fact about ONE cluster's objects, which is why a declaration may
+  # say it and the catalogue may not. Left unsaid, the two are the same word.
+  nameOf = w: key: if w.state.${key}.volumeName != null then w.state.${key}.volumeName else key;
+
   # The split in one function: WHERE inside the container comes from the catalogue, WHAT BACKS IT
-  # comes from the declaration, and neither side can supply the other's half.
+  # and WHAT IT IS CALLED come from the declaration, and neither side can supply the other's half.
   stateOf = entry: w:
-    lib.mapAttrs
-      (key: backing: {
-        inherit (entry.state.${key}) mountPath;
-        inherit (backing) claim hostPath hostPathType readOnly ownership;
-      })
+    lib.mapAttrs'
+      (key: backing:
+        lib.nameValuePair (nameOf w key) {
+          inherit (entry.state.${key}) mountPath;
+          inherit (backing) claim hostPath hostPathType readOnly ownership;
+        })
       w.state;
 
   # Where a companion workload is. The VARIABLE is the catalogue's, the URL is the declaration's, and
@@ -178,6 +186,17 @@ let
             + "of what it holds.";
         }
         {
+          assertion =
+            lib.length (lib.unique (map (key: nameOf w key) (lib.attrNames w.state)))
+              == lib.length (lib.attrNames w.state);
+          message =
+            "nixvault: archive `${name}` gives two of the directories it keeps ONE name ("
+            + lib.concatMapStringsSep ", " (k: "`${k}` -> `${nameOf w k}`") (lib.attrNames w.state)
+            + "). A volume name is the identity of the storage inside the pod, so two of them wearing "
+            + "one name is not a merge — it is one directory rendered and the other silently gone, "
+            + "and for an archive the one that vanishes is a copy nobody has anywhere else.";
+        }
+        {
           assertion = lib.all
             (key: !(entry.state.${key}.grows && w.state.${key}.ownership == "kubelet"))
             (sharedKeys w.state entry.state);
@@ -190,24 +209,34 @@ let
       ])
     workloads;
 
-  # The rendered mount list is emitted in attribute order, so for one archive nested inside another
-  # the OUTER mount must sort first or it is written on top of the inner one and hides it. This reads
-  # the catalogue rather than a declaration: it is a guard against a rename in THIS repository, which
-  # is exactly the change that would look harmless.
+  # Every pair of directories where one is mounted INSIDE the other, read off the catalogue's mount
+  # paths. The rendered mount list is emitted in attribute order, so the outer mount has to be
+  # written first: lay the outer one on top of the inner one and the archive is still on the disk and
+  # the application can no longer see it. Two things are checked against this — the catalogue's own
+  # key names, and whatever a declaration renames them to.
+  nestedPairs = entry:
+    let
+      keys = lib.attrNames entry.state;
+      pathOf = k: entry.state.${k}.mountPath;
+    in
+    lib.concatMap
+      (outer: lib.concatMap
+        (inner:
+          lib.optional
+            (outer != inner && lib.hasPrefix "${pathOf outer}/" (pathOf inner))
+            { inherit outer inner; })
+        keys)
+      keys;
+
+  # THIS ONE READS THE CATALOGUE, not a declaration: it is a guard against a rename in THIS
+  # repository, which is exactly the change that would look harmless. Nobody downstream asked for it
+  # and nobody downstream can see it coming, so it is an error rather than a warning.
   nestingAssertions = lib.concatMap
     (x:
       let
         inherit (x) name entry;
-        keys = lib.attrNames entry.state;
         pathOf = k: entry.state.${k}.mountPath;
-        covered = lib.concatMap
-          (outer: lib.concatMap
-            (inner:
-              lib.optional
-                (outer != inner && lib.hasPrefix "${pathOf outer}/" (pathOf inner) && outer > inner)
-                { inherit outer inner; })
-            keys)
-          keys;
+        covered = lib.filter (c: c.outer > c.inner) (nestedPairs entry);
       in
       map
         (c: {
@@ -379,8 +408,26 @@ let
   # travels with the text rather than being applied here.
   warnings = lib.concatMap
     (x:
-      let inherit (x) name w; in
-      [
+      let
+        inherit (x) name w entry;
+        inverted = lib.filter (c: nameOf w c.outer > nameOf w c.inner) (nestedPairs entry);
+      in
+      map
+        (c: {
+          when = true;
+          message =
+            "nixvault: archive `${name}` calls `${c.inner}` (${entry.state.${c.inner}.mountPath}) "
+            + "`${nameOf w c.inner}` and `${c.outer}` (${entry.state.${c.outer}.mountPath}) "
+            + "`${nameOf w c.outer}`, and those names sort the wrong way round. Mounts are emitted in "
+            + "attribute-name order, so the inner one is written FIRST and the outer one is laid on "
+            + "top of it: the archive stays on the disk and the application stops being able to see "
+            + "it. That is not refused here, because the order is a property of the rendered object "
+            + "and pinning it is the consumer's — but an unpinned render of these names archives into "
+            + "the wrong directory silently. Either pin the order where the objects are rendered, or "
+            + "take the names the catalogue already sorts correctly.";
+        })
+        inverted
+      ++ [
         {
           when = w.slot != null && platform.origin == null;
           message =
@@ -482,9 +529,10 @@ let
     state = lib.mkOption {
       default = { };
       description = ''
-        What backs each directory the catalogue says this archive keeps, keyed by the SAME names.
-        Backing a directory it does not keep, or leaving one it does keep unbacked, is an eval error
-        rather than a surprise at runtime.
+        What backs each directory the catalogue says this archive keeps, and what each one is called
+        once it is an object in a cluster, keyed by the catalogue's OWN names. Backing a directory it
+        does not keep, or leaving one it does keep unbacked, is an eval error rather than a surprise
+        at runtime.
       '';
       type = lib.types.attrsOf (lib.types.submodule {
         options = {
@@ -520,6 +568,31 @@ let
               them; `kubelet` means the kubelet takes group ownership, which it does by changing the
               tree recursively on EVERY pod start. Asking for that on a directory the catalogue says
               grows without bound is refused.
+            '';
+          };
+          volumeName = lib.mkOption {
+            type = lib.types.nullOr lib.types.str;
+            default = null;
+            defaultText = lib.literalExpression "the catalogue's own name for the directory";
+            example = "media";
+            description = ''
+              WHAT THIS DIRECTORY IS CALLED as an object in the cluster, when it is already called
+              something. The catalogue's key is this repository's name for a directory — the word a
+              declaration writes against — and by default it is also the name the rendered volume and
+              its mount carry. They are not the same kind of fact: the application never learns
+              either, and the second one is whatever somebody typed the day the workload was first
+              created.
+
+              THIS EXISTS TO ADOPT A RUNNING WORKLOAD WITHOUT MOVING IT. A volume name lives inside
+              the pod template, so changing one is a new pod template, which for an archive — never
+              two replicas, never a rolling update — means the running copy stops before its
+              replacement starts. Somebody who already runs this software under other names can put
+              them here and get the manifest they already have, byte for byte, instead of trading
+              downtime for a spelling.
+
+              Two directories may not resolve to one name, and a rename that makes a nested pair sort
+              the wrong way round is warned about loudly: mounts are emitted in name order, and an
+              inner mount written first is an archive the application cannot see.
             '';
           };
         };

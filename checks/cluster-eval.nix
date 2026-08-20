@@ -98,6 +98,15 @@ let
     "an archive nested inside another sorts after it, so the outer mount is written first" =
       lib.attrNames pages.state == [ "data" "snapshots" ];
 
+    "a directory the cluster already had a name for reaches the grammar under THAT name" =
+      videos.state ? videos
+      && !(videos.state ? media)
+      && videos.state.videos.mountPath == "/youtube"
+      && videos.state.videos.hostPath == "/example/archive/videos";
+
+    "and one that was never renamed keeps the catalogue's own name" =
+      pages.state ? snapshots && videos.state ? cache;
+
     "the kubelet may own a bounded directory and is kept off the growing one" =
       pages.state.data.ownership == "kubelet"
       && pages.state.snapshots.ownership == "site-curated";
@@ -169,6 +178,10 @@ let
       failsWith "never both and never neither"
         (with' { nixvault.archives.example-pages.state.snapshots.claim = "example-claim"; });
 
+    "renaming two directories onto one volume name is refused" =
+      failsWith "ONE name"
+        (with' { nixvault.archives.example-videos.state.cache.volumeName = "videos"; });
+
     "handing a GROWING directory to the kubelet is refused" =
       failsWith "hands a GROWING directory"
         (with' { nixvault.archives.example-pages.state.snapshots.ownership = "kubelet"; });
@@ -235,6 +248,23 @@ let
 
     "a whole image reference warns that the version beside it now chooses nothing" =
       lib.any (w: w.when && lib.hasInfix "documentation only" w.message) goodCfg.nixidy.warnings;
+
+    # A rename that puts a nested pair in the wrong order is the one place this module warns about
+    # something it would rather refuse. The order is a property of the RENDERED object and pinning it
+    # belongs to whoever renders -- refusing here would make a live workload whose objects already
+    # carry those names unadoptable, and the cure (delete and recreate a single-writer archive) is
+    # worse than the disease it is guarding against.
+    "renaming a directory so it sorts before the one that covers it warns, and still renders" =
+      let v = with' { nixvault.archives.example-pages.state.snapshots.volumeName = "aaa-archive"; }; in
+      renders v
+      && lib.any
+        (w: w.when && lib.hasInfix "sort the wrong way round" w.message)
+        (mkEnv v).config.nixidy.warnings;
+
+    "and the same declaration under a name that sorts correctly warns about nothing of the kind" =
+      !(lib.any
+        (w: w.when && lib.hasInfix "sort the wrong way round" w.message)
+        goodCfg.nixidy.warnings);
   };
 
   failed = lib.filter (n: !results.${n}) (lib.attrNames results);
